@@ -22,6 +22,8 @@ GP_prefix = 'GP'
 separator = ' | '
 bot = commands.Bot(command_prefix=prefix, intents=discord.Intents.all())
 LedukasSpam_channelID = os.environ.get('SPAM_CHANNEL_ID')
+email_a = os.environ.get('EMAIL_A')
+email_p = os.environ.get('EMAIL_P')
 
 conn = sqlite3.connect('DatabaseLedBot.db')
 
@@ -41,15 +43,14 @@ roles_to_remove = {
     'giverole': 'Former Aetherian',
 }
 
-
 guilds_data = {
     "Aetherians": {
         "gid": "jSiitSSM7nO0HFuoVlsa",
-        "email": os.environ.get('EMAIL_A')
+        "email": email_a
         },
     "Pretherians": {
         "gid": "yuFnrJvPfK8ZdfFXHojg",
-        "email": os.environ.get('EMAIL_P')
+        "email": email_p
         }
     }
 
@@ -96,7 +97,7 @@ async def members_discord(ctx):
 @bot.command(name='members_game')
 @commands.has_role("Moderator")
 async def members_guild(ctx):
-    await Functions.GP_export()
+    await Functions.GP_export(email_a, email_p)
     await ctx.send("GP exported")
 
 
@@ -236,10 +237,10 @@ async def invite(ctx, IOguild, InviteName):
         return
     if IOguild == "Aetherians":
         gid = "jSiitSSM7nO0HFuoVlsa"
-        email = os.environ.get('EMAIL_A')
+        email = email_a
     elif IOguild == "Pretherians": 
         gid = "yuFnrJvPfK8ZdfFXHojg"
-        email = os.environ.get('EMAIL_P')
+        email = email_p
     else: 
         await ctx.send("That's not our guild!")
         return
@@ -292,10 +293,10 @@ async def kick(ctx, IOguild, KickID):
         return
     if IOguild == "Aetherians":
         gid = "jSiitSSM7nO0HFuoVlsa"
-        email = os.environ.get('EMAIL_A')
+        email = email_a
     elif IOguild == "Pretherians": 
         gid = "yuFnrJvPfK8ZdfFXHojg"
-        email = os.environ.get('EMAIL_P')
+        email = email_p
     else: 
         await ctx.send("That's not our guild!")
         return
