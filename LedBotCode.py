@@ -21,7 +21,7 @@ prefix = '!'
 GP_prefix = 'GP'
 separator = ' | '
 bot = commands.Bot(command_prefix=prefix, intents=discord.Intents.all())
-LedukasSpam_channelID = 1066658447602483240
+LedukasSpam_channelID = os.environ.get('SPAM_CHANNEL_ID')
 
 conn = sqlite3.connect('DatabaseLedBot.db')
 

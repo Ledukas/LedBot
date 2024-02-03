@@ -265,7 +265,7 @@ async def GP_export():
 
     ## Configure Firebase
     config = {
-        "apiKey": "AIzaSyAU62kOE6xhSrFqoXQPv6_WHxYilmoUxDk",
+        "apiKey": os.environ.get('FIRE_API'),
         "authDomain": "idlemmo.firebaseapp.com",
         "databaseURL": "https://idlemmo.firebaseio.com",
         "storageBucket": "idlemmo.appspot.com"
