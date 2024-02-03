@@ -72,7 +72,7 @@ async def GP_dataframe(IOguild):
         monthly_gp_df[column] = pd.to_numeric(monthly_gp_df[column], errors='coerce')
     monthly_gp_df[column_names_int] = monthly_gp_df[column_names_int].fillna(pd.NA).astype('Int64')
     
-    new_column_names = {column: column.replace('GP2023_', '') for column in column_names_int}
+    new_column_names = {column: column.replace('GP2024_', '') for column in column_names_int}
     monthly_gp_df = monthly_gp_df.rename(columns=new_column_names)
     
     try:
@@ -250,16 +250,16 @@ async def promotions(bot, channel):
 
 
     
-async def GP_export():
+async def GP_export(email_a, email_p):
 
     guilds_data = {
         "Aetherians": {
             "gid": "jSiitSSM7nO0HFuoVlsa",
-            "email": os.environ.get('EMAIL_A')
+            "email": email_a
         },
         "Pretherians": {
             "gid": "yuFnrJvPfK8ZdfFXHojg",
-            "email": os.environ.get('EMAIL_P')
+            "email": email_p
         }
     }
 
