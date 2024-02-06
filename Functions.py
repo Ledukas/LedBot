@@ -201,7 +201,7 @@ async def red_gp(channel, monthly_gp_df, IOguild):
     formatted_data = '\n'.join(formatted_lines)
     
     with open('red.txt', 'w') as file:
-        file.write('f{IOguild} \n')
+        file.write(f'{IOguild} \n')
         file.write(df_red_gp.columns.to_list()[0].ljust(14))  # Write the first column header
         for column in df_red_gp.columns[1:]:
             file.write(separator + column.ljust(7))  # Write the remaining column headers
@@ -219,30 +219,26 @@ async def red_gp(channel, monthly_gp_df, IOguild):
 
 async def promotions(bot, channel):
     with open('promo.txt', 'w') as file:
-        file.write(f"Discord name | GP\n")
+        file.write(f"Discord name    | GP\n")
     column_names_dict = await get_date()
     column_name1 = column_names_dict["column_name1"]
     role = discord.utils.get(channel.guild.roles, name="Promotions")
     guild = bot.get_guild(809954021028134943)
-    c.execute('''SELECT D_ID FROM Pretherians_members''')
+    
+    c.execute(f'''SELECT PM.D_ID, PM.G_ID, PGG.{column_name1}
+    FROM Pretherians_members AS PM
+    JOIN Pretherians_GP_gained AS PGG ON PM.G_ID = PGG.G_ID
+    WHERE PGG.{column_name1} >= 400''')
+
     result = c.fetchall()
     for item in result:
-        D_ID = item[0]
-        member = guild.get_member(D_ID)
+        member = guild.get_member(item[0])
+        GP = item[2]
         if member is None:
-            continue
+            return 'No members meet requirements'
         if role in member.roles:
-            c.execute(f'''SELECT G_ID FROM Pretherians_members
-                      WHERE D_ID = {D_ID}''')
-            G_ID = c.fetchone()[0]
-            try: 
-                c.execute(f"SELECT {column_name1} FROM Pretherians_GP_gained WHERE G_ID = ?", (G_ID,))
-            except Exception as e:
-                print(e)
-            GP = int(c.fetchone()[0])
-            if GP > 400:
-                with open('promo.txt', 'a') as file:
-                    file.write(f"{member.name} | {GP}\n")
+            with open('promo.txt', 'a') as file:
+                file.write(f"{member.name.ljust(15)} | {GP}\n")
 
     file = discord.File('promo.txt')
     await channel.send(file=file)

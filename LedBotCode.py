@@ -21,7 +21,7 @@ prefix = '!'
 GP_prefix = 'GP'
 separator = ' | '
 bot = commands.Bot(command_prefix=prefix, intents=discord.Intents.all())
-LedukasSpam_channelID = os.environ.get('SPAM_CHANNEL_ID')
+LedukasSpam_channelID = int(os.environ.get('SPAM_CHANNEL_ID'))
 email_a = os.environ.get('EMAIL_A')
 email_p = os.environ.get('EMAIL_P')
 
@@ -210,7 +210,19 @@ async def sync_counters(ctx):
 #assign members in-game and discord
 @bot.command(name='assign')
 @commands.has_role("Moderator")
-async def assign(ctx, IOguild, user: discord.User, game_name):
+async def assign(ctx, IOguild, user_param, game_name):
+    # Check if user_param is a mention
+    if user_param.startswith('<@') and user_param.endswith('>'):
+        # Remove '<@' and '>' to get the user ID
+        user_id = int(user_param[2:-1])
+        # Fetch the user from the ID
+        user = ctx.guild.get_member(user_id)
+    else:
+        # Try to find the user by username
+        user = discord.utils.get(ctx.guild.members, name=user_param)
+        if user is None:
+            await ctx.send("User not found.")
+            return
 
     input_string = ctx.message.content
     args = shlex.split(input_string)
@@ -222,7 +234,7 @@ async def assign(ctx, IOguild, user: discord.User, game_name):
     game = c.execute('SELECT * FROM ' + table_name_game + ' WHERE G_NAME = ?', (value,)).fetchone()
     c.execute('INSERT INTO ' + table_name_members + ' (Discord, D_ID, Display, G_ID, G_NAME) VALUES (?,?,?,?,?)', (user.name + '#' + user.discriminator, user.id, user.display_name, game[2], game[1]))
 
-    await ctx.send("Assignement succesfull")
+    await ctx.send("Assignment successful")
     conn.commit()
 
 
@@ -379,9 +391,10 @@ async def mygains(ctx):
     c.execute("SELECT * FROM Pretherians_discord WHERE D_ID = ?", (str(user_did),))
     result_pretherians = c.fetchone()
 
-    if not result_aetherians and not result_pretherians:
+    if result_aetherians == None and result_pretherians == None:
         print("No GP gains recorded")
         message = "No GP gains recorded yet"
+        await ctx.send(message)
     elif result_aetherians and not result_pretherians:
         IOguild = "Aetherians"
         message = await mygains2(IOguild, c, user_did)
@@ -398,6 +411,7 @@ async def mygains(ctx):
         IOguild_pretherians = "Pretherians"
         message_pretherians = await mygains2(IOguild_pretherians, c, user_did)
         await ctx.send(message_pretherians)   
+
 async def mygains2(IOguild, c, user_did):
     
     table_name_members = IOguild+'_members'
