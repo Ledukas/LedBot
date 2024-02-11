@@ -71,6 +71,22 @@ async def led_stop(ctx):
     await ctx.send("Shutting down...")
     await bot.logout()
 
+#backup for the database
+@bot.command(name="backup")
+@commands.has_role("Moderator")
+async def export_data(ctx):
+    
+    try:
+        c = conn.cursor()
+        # Create a backup file
+        date = datetime.now()
+        backup_name = f"Backup_{date.year}_{date.month}_{date.day}"
+        with open(backup_name, 'w', encoding='utf-8') as backup_file:
+            for line in conn.iterdump():
+                backup_file.write('%s\n' % line)
+        await ctx.send("Backup created")
+    except Exception as e:
+        print(e)
 
 # export members from discord
 @bot.command(name='members_discord')
@@ -211,30 +227,31 @@ async def sync_counters(ctx):
 @bot.command(name='assign')
 @commands.has_role("Moderator")
 async def assign(ctx, IOguild, user_param, game_name):
-    # Check if user_param is a mention
-    if user_param.startswith('<@') and user_param.endswith('>'):
-        # Remove '<@' and '>' to get the user ID
-        user_id = int(user_param[2:-1])
-        # Fetch the user from the ID
-        user = ctx.guild.get_member(user_id)
+    
+    # Try to get user by ID
+    try:
+        user = await bot.fetch_user(int(user_param))
+    except ValueError:
+        # If the user_param is not a valid ID, try to get user by display name
+        user = discord.utils.find(lambda u: u.name == user_param or u.display_name == user_param, ctx.guild.members)
+
+    if user:
+        
+        input_string = ctx.message.content
+        args = shlex.split(input_string)
+        game_name = args[3]
+        table_name_members = IOguild+'_members'
+        table_name_game = IOguild+'_game'
+        
+        c = conn.cursor()
+        game = c.execute('SELECT * FROM ' + table_name_game + ' WHERE G_NAME = ?', (game_name,)).fetchone()
+        c.execute('INSERT INTO ' + table_name_members + ' (Discord, D_ID, Display, G_ID, G_NAME) VALUES (?,?,?,?,?)',
+                  (user.name + '#' + user.discriminator, user.id, user.display_name, game[2], game[1]))
+
+        await ctx.send(f"Assigned {game_name} to {user.display_name}, {user.id}")
     else:
-        # Try to find the user by username
-        user = discord.utils.get(ctx.guild.members, name=user_param)
-        if user is None:
-            await ctx.send("User not found.")
-            return
-
-    input_string = ctx.message.content
-    args = shlex.split(input_string)
-    game_name = args[3]
-    value = game_name
-    table_name_members = IOguild+'_members'
-    table_name_game = IOguild+'_game'
-    c = conn.cursor()
-    game = c.execute('SELECT * FROM ' + table_name_game + ' WHERE G_NAME = ?', (value,)).fetchone()
-    c.execute('INSERT INTO ' + table_name_members + ' (Discord, D_ID, Display, G_ID, G_NAME) VALUES (?,?,?,?,?)', (user.name + '#' + user.discriminator, user.id, user.display_name, game[2], game[1]))
-
-    await ctx.send("Assignment successful")
+        await ctx.send("User not found.")
+        
     conn.commit()
 
 
@@ -534,9 +551,15 @@ async def run_at_specific_time():
 ##---------------------------------------------  Errors
 # error messages for all commands
 @assign.error
-async def on_command_error(ctx, error):
-    await ctx.send("Command error")
-
+async def assign_error(ctx, error):
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send("Missing required argument. Please provide all the necessary parameters.")
+    elif isinstance(error, commands.CommandInvokeError):
+        await ctx.send(f"An error occurred while processing the command: {error.original}")
+    elif isinstance(error, commands.UserNotFound):
+        await ctx.send("User not found.")
+    else:
+        await ctx.send("Command error")
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.MissingRole):
