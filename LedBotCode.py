@@ -17,11 +17,13 @@ import Functions
 load_dotenv()
 
 TOKEN = os.environ.get('TOKEN')
+SERVER_ID = os.environ.get('SERVER_ID')
 prefix = '!'
 GP_prefix = 'GP'
 separator = ' | '
 bot = commands.Bot(command_prefix=prefix, intents=discord.Intents.all())
 LedukasSpam_channelID = int(os.environ.get('SPAM_CHANNEL_ID'))
+BotCommands_channelID = int(os.environ.get('COMMANDS_CHANNEL_ID'))
 email_a = os.environ.get('EMAIL_A')
 email_p = os.environ.get('EMAIL_P')
 
@@ -265,11 +267,11 @@ async def invite(ctx, IOguild, InviteName):
         await ctx.send(f"No role given")
         return
     if IOguild == "Aetherians":
-        gid = "jSiitSSM7nO0HFuoVlsa"
-        email = email_a
+        gid = guilds_data["Aetherians"]["gid"]
+        email = guilds_data["Aetherians"]["email"]
     elif IOguild == "Pretherians": 
-        gid = "yuFnrJvPfK8ZdfFXHojg"
-        email = email_p
+        gid = guilds_data["Pretherians"]["gid"]
+        email = guilds_data["Pretherians"]["email"]
     else: 
         await ctx.send("That's not our guild!")
         return
@@ -313,19 +315,18 @@ async def invite(ctx, IOguild, InviteName):
 @bot.command(name='kick')
 @commands.has_role("Moderator")
 async def kick(ctx, IOguild, KickID):
-    
-    guild = bot.get_guild(809954021028134943)
+    guild = bot.get_guild(SERVER_ID)
     
     # login
     if IOguild is None:
         await ctx.send(f"No role given")
         return
     if IOguild == "Aetherians":
-        gid = "jSiitSSM7nO0HFuoVlsa"
-        email = email_a
+        gid = guilds_data["Aetherians"]["gid"]
+        email = guilds_data["Aetherians"]["email"]
     elif IOguild == "Pretherians": 
-        gid = "yuFnrJvPfK8ZdfFXHojg"
-        email = email_p
+        gid = guilds_data["Pretherians"]["gid"]
+        email = guilds_data["Pretherians"]["email"]
     else: 
         await ctx.send("That's not our guild!")
         return
@@ -395,7 +396,7 @@ async def kick(ctx, IOguild, KickID):
 # a command to check gains
 @bot.command(name='mygains')
 async def mygains(ctx):
-    if ctx.channel.id != 810014953477898240:
+    if ctx.channel.id != BotCommands_channelID:
         await ctx.message.delete()
         return
     
