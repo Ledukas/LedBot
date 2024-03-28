@@ -11,6 +11,7 @@ load_dotenv()
 conn = sqlite3.connect('DatabaseLedBot.db')
 c = conn.cursor()
 password = os.environ.get('PASSWORD')
+SERVER_ID = os.environ.get('SERVER_ID')
 
 GP_prefix = 'GP'
 separator = ' | '
@@ -90,7 +91,7 @@ async def GP_roles(bot, monthly_gp_df):
                  FROM Aetherians_game JOIN Aetherians_members 
                  ON Aetherians_game.G_ID = Aetherians_members.G_ID''')
     result = c.fetchall()
-    guild = bot.get_guild(809954021028134943)
+    guild = bot.get_guild(SERVER_ID)
     for row in result:
         D_ID = row[0]
         GP = row[1]
@@ -223,7 +224,7 @@ async def promotions(bot, channel):
     column_names_dict = await get_date()
     column_name1 = column_names_dict["column_name1"]
     role = discord.utils.get(channel.guild.roles, name="Promotions")
-    guild = bot.get_guild(809954021028134943)
+    guild = bot.get_guild(SERVER_ID)
     
     c.execute(f'''SELECT PM.D_ID, PM.G_ID, PGG.{column_name1}
     FROM Pretherians_members AS PM
@@ -261,7 +262,7 @@ async def GP_export(email_a, email_p):
 
     ## Configure Firebase
     config = {
-        "apiKey": os.environ.get('FIRE_API'),
+        "apiKey": os.environ.get('FIRE_APIKEY'),
         "authDomain": "idlemmo.firebaseapp.com",
         "databaseURL": "https://idlemmo.firebaseio.com",
         "storageBucket": "idlemmo.appspot.com"
