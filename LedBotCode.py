@@ -1,4 +1,5 @@
 import discord
+from discord import app_commands
 from discord.ext import commands
 from discord.ext.commands.bot import Bot
 import pandas as pd
@@ -11,19 +12,18 @@ import shlex
 from datetime import datetime, timedelta
 import inspect
 import asyncio
+import random
 
 import Functions
 
 load_dotenv()
 
 TOKEN = os.environ.get('TOKEN')
-SERVER_ID = os.environ.get('SERVER_ID')
 prefix = '!'
 GP_prefix = 'GP'
 separator = ' | '
 bot = commands.Bot(command_prefix=prefix, intents=discord.Intents.all())
 LedukasSpam_channelID = int(os.environ.get('SPAM_CHANNEL_ID'))
-BotCommands_channelID = int(os.environ.get('COMMANDS_CHANNEL_ID'))
 email_a = os.environ.get('EMAIL_A')
 email_p = os.environ.get('EMAIL_P')
 
@@ -36,7 +36,8 @@ role_3_demigod = 5000
 role_4_deity = 10000
 role_5_titan = 25000
 role_6_primordial = 50000
-GProles = [role_6_primordial, role_5_titan, role_4_deity, role_3_demigod, role_2_hero, role_1_knight]
+role_7_true = 100000
+GProles = [role_6_primordial, role_5_titan, role_4_deity, role_3_demigod, role_2_hero, role_1_knight, role_7_true]
 
 df_members_game = None
 
@@ -56,6 +57,18 @@ guilds_data = {
         }
     }
 
+# Load cogs
+async def load_cogs():
+    cogs_path = "cogs"  # The directory where your cogs are stored
+    for filename in os.listdir(cogs_path):
+        if filename.endswith(".py"):  # Only load Python files
+            extension = f"{cogs_path}.{filename[:-3]}"  # Convert to module path
+            try:
+                await bot.load_extension(extension)
+                print(f"Loaded cog: {extension}")
+            except Exception as e:
+                print(f"Failed to load cog {extension}: {e}")
+
 
 #pd.set_option('display.max_rows', None)  
 
@@ -72,6 +85,19 @@ async def led_stop(ctx):
     print("Shutting down...")
     await ctx.send("Shutting down...")
     await bot.logout()
+ 
+@bot.command()
+@commands.has_any_role("Aetherians", "Pretherians", "Moderator")
+@commands.cooldown(1, 15, commands.BucketType.guild)
+async def gemdrop(ctx):
+    message = (
+        "Lava is doing a Gem(velope) Drop/Reset right now! "
+        "Make sure you are in one of the following servers if it's a Gem(velope) Drop!\n\n"
+        "Servers the drops can happen in: Carrot/Cake/Balloon/Pecunia/Dice. "
+        "***Must be in W1 Town to get the drops!***\n"
+        "<@&852898751219761152>"
+    )
+    await ctx.send(message)
 
 #backup for the database
 @bot.command(name="backup")
@@ -248,7 +274,7 @@ async def assign(ctx, IOguild, user_param, game_name):
         c = conn.cursor()
         game = c.execute('SELECT * FROM ' + table_name_game + ' WHERE G_NAME = ?', (game_name,)).fetchone()
         c.execute('INSERT INTO ' + table_name_members + ' (Discord, D_ID, Display, G_ID, G_NAME) VALUES (?,?,?,?,?)',
-                  (user.name + '#' + user.discriminator, user.id, user.display_name, game[2], game[1]))
+                    (user.name + '#' + user.discriminator, user.id, user.display_name, game[2], game[1]))
 
         await ctx.send(f"Assigned {game_name} to {user.display_name}, {user.id}")
     else:
@@ -267,11 +293,11 @@ async def invite(ctx, IOguild, InviteName):
         await ctx.send(f"No role given")
         return
     if IOguild == "Aetherians":
-        gid = guilds_data["Aetherians"]["gid"]
-        email = guilds_data["Aetherians"]["email"]
+        gid = "jSiitSSM7nO0HFuoVlsa"
+        email = email_a
     elif IOguild == "Pretherians": 
-        gid = guilds_data["Pretherians"]["gid"]
-        email = guilds_data["Pretherians"]["email"]
+        gid = "yuFnrJvPfK8ZdfFXHojg"
+        email = email_p
     else: 
         await ctx.send("That's not our guild!")
         return
@@ -307,7 +333,7 @@ async def invite(ctx, IOguild, InviteName):
     if result_value is None:
         await ctx.send("Error, invite not sent")
     elif result_value.lower() == "true":
-        await ctx.send("Invite sent. Let me know when you join")
+        await ctx.send("Invite sent. Let a moderator know when you join")
     else:
         await ctx.send("Error, invite not sent")
     
@@ -315,18 +341,19 @@ async def invite(ctx, IOguild, InviteName):
 @bot.command(name='kick')
 @commands.has_role("Moderator")
 async def kick(ctx, IOguild, KickID):
-    guild = bot.get_guild(SERVER_ID)
+    
+    guild = bot.get_guild(809954021028134943)
     
     # login
     if IOguild is None:
         await ctx.send(f"No role given")
         return
     if IOguild == "Aetherians":
-        gid = guilds_data["Aetherians"]["gid"]
-        email = guilds_data["Aetherians"]["email"]
+        gid = "jSiitSSM7nO0HFuoVlsa"
+        email = email_a
     elif IOguild == "Pretherians": 
-        gid = guilds_data["Pretherians"]["gid"]
-        email = guilds_data["Pretherians"]["email"]
+        gid = "yuFnrJvPfK8ZdfFXHojg"
+        email = email_p
     else: 
         await ctx.send("That's not our guild!")
         return
@@ -392,11 +419,11 @@ async def kick(ctx, IOguild, KickID):
         await ctx.send(f"{Disp_result} has been kicked from {IOguild}")
     else:
         await ctx.send("Error, not kicked")
- 
+
 # a command to check gains
 @bot.command(name='mygains')
 async def mygains(ctx):
-    if ctx.channel.id != BotCommands_channelID:
+    if ctx.channel.id != 810014953477898240:
         await ctx.message.delete()
         return
     
@@ -489,22 +516,42 @@ async def mygains2(IOguild, c, user_did):
 async def promotions(ctx):
     await Functions.promotions(bot, LedukasSpam_channel)
 
+#baba pings
+async def baba_ping():
+    global baba_task
+    guild = bot.get_guild(809954021028134943) 
+    baba_role = discord.utils.get(guild.roles, name="Spiketrap")
+    baba_channel = bot.get_channel(1032916681569349632)
+    while True:
+        now = datetime.now()
+        current_time = now.strftime("%H:%M:%S")
+        if now.minute == 57:
+            await baba_channel.send(f"{baba_role.mention} The spiketrap is awaiting your death!")
+            await asyncio.sleep(100)
+        else:
+            await asyncio.sleep(40)
+
 #does weekly GP things
 async def GP_weekly_auto():
 
+    print("Starting weekly GP process")
     await members_guild(LedukasSpam_channel) 
+    print("test1")
     await Functions.GP_databases()
+    print("test2")
     
     IOguild = "Aetherians"
     monthly_gp_df = await Functions.GP_dataframe(IOguild)
     await Functions.GP_roles(bot, monthly_gp_df)
     await LedukasSpam_channel.send("GP roles fixed!")
     await Functions.red_gp(LedukasSpam_channel, monthly_gp_df, IOguild)
+    print("test3")
     
     IOguild = "Pretherians"
     monthly_gp_df = await Functions.GP_dataframe(IOguild)
     await Functions.red_gp(LedukasSpam_channel, monthly_gp_df, IOguild)
     #await Functions.promotions(bot, LedukasSpam_channel)
+    print("test4")
     
     print("weekly GP calculated automatically")
     conn.commit()
@@ -571,13 +618,22 @@ async def on_command_error(ctx, error):
         await ctx.send("The bot doesn't have the required permissions to run this command.")
     elif isinstance(error, commands.UserInputError):
         await ctx.send("There was an error in the input.")
+    elif isinstance(error, commands.CommandOnCooldown):
+        pass
+        
+        
+baba_task = None
 # gives a message in console once the bot goes live
 @bot.event
 async def on_ready():
     print(f'Logged in with {bot.user.name} | {bot.user.id}')
+    if baba_task is None:
+        bot.loop.create_task(baba_ping())
     bot.loop.create_task(run_at_specific_time())
     global LedukasSpam_channel
     LedukasSpam_channel = bot.get_channel(LedukasSpam_channelID)
+    
+    await load_cogs()
 bot.run(TOKEN)
 
 conn.close
