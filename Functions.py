@@ -11,7 +11,6 @@ load_dotenv()
 conn = sqlite3.connect('DatabaseLedBot.db')
 c = conn.cursor()
 password = os.environ.get('PASSWORD')
-SERVER_ID = os.environ.get('SERVER_ID')
 
 GP_prefix = 'GP'
 separator = ' | '
@@ -22,7 +21,8 @@ role_3_demigod = 5000
 role_4_deity = 10000
 role_5_titan = 25000
 role_6_primordial = 50000
-GProles = [role_6_primordial, role_5_titan, role_4_deity, role_3_demigod, role_2_hero, role_1_knight]
+role_7_true = 100000
+GProles = [role_6_primordial, role_5_titan, role_4_deity, role_3_demigod, role_2_hero, role_1_knight, role_7_true]
 
 #get date
 async def get_date():
@@ -73,7 +73,7 @@ async def GP_dataframe(IOguild):
         monthly_gp_df[column] = pd.to_numeric(monthly_gp_df[column], errors='coerce')
     monthly_gp_df[column_names_int] = monthly_gp_df[column_names_int].fillna(pd.NA).astype('Int64')
     
-    new_column_names = {column: column.replace('GP2024_', '') for column in column_names_int}
+    new_column_names = {column: column.replace('GP2025_', '') for column in column_names_int}
     monthly_gp_df = monthly_gp_df.rename(columns=new_column_names)
     
     try:
@@ -88,10 +88,10 @@ async def GP_dataframe(IOguild):
 #GP roles and clammies for Aetherians
 async def GP_roles(bot, monthly_gp_df):
     c.execute('''SELECT Aetherians_members.D_ID, Aetherians_game.GP 
-                 FROM Aetherians_game JOIN Aetherians_members 
-                 ON Aetherians_game.G_ID = Aetherians_members.G_ID''')
+                FROM Aetherians_game JOIN Aetherians_members 
+                ON Aetherians_game.G_ID = Aetherians_members.G_ID''')
     result = c.fetchall()
-    guild = bot.get_guild(SERVER_ID)
+    guild = bot.get_guild(809954021028134943)
     for row in result:
         D_ID = row[0]
         GP = row[1]
@@ -133,11 +133,18 @@ async def GP_roles(bot, monthly_gp_df):
                 role2remove = discord.utils.get(guild.roles, name = 'Aetherian Deity')
                 await member.remove_roles(role2remove)
 
-        elif GP > role_6_primordial:
+        elif GP > role_6_primordial and GP < role_7_true:
             role2give = discord.utils.get(guild.roles, name = 'Aetherian Primordial')
             if role2give not in member.roles:
                 await member.add_roles(role2give)
                 role2remove = discord.utils.get(guild.roles, name = 'Aetherian Titan')
+                await member.remove_roles(role2remove)
+        
+        elif GP > role_7_true:
+            role2give = discord.utils.get(guild.roles, name = 'True Aetherian')
+            if role2give not in member.roles:
+                await member.add_roles(role2give)
+                role2remove = discord.utils.get(guild.roles, name = 'Aetherian Primordial')
                 await member.remove_roles(role2remove)
                 
     monthly_gp_df.dropna(inplace=True)
@@ -219,31 +226,39 @@ async def red_gp(channel, monthly_gp_df, IOguild):
     os.remove('red.txt')
 
 async def promotions(bot, channel):
-    with open('promo.txt', 'w') as file:
-        file.write(f"Discord name    | GP\n")
-    column_names_dict = await get_date()
-    column_name1 = column_names_dict["column_name1"]
-    role = discord.utils.get(channel.guild.roles, name="Promotions")
-    guild = bot.get_guild(SERVER_ID)
-    
-    c.execute(f'''SELECT PM.D_ID, PM.G_ID, PGG.{column_name1}
-    FROM Pretherians_members AS PM
-    JOIN Pretherians_GP_gained AS PGG ON PM.G_ID = PGG.G_ID
-    WHERE PGG.{column_name1} >= 400''')
-
-    result = c.fetchall()
-    for item in result:
-        member = guild.get_member(item[0])
-        GP = item[2]
-        if member is None:
-            return 'No members meet requirements'
-        if role in member.roles:
-            with open('promo.txt', 'a') as file:
-                file.write(f"{member.name.ljust(15)} | {GP}\n")
-
-    file = discord.File('promo.txt')
-    await channel.send(file=file)
-    os.remove('promo.txt')
+    try:
+        with open('promo.txt', 'w') as file:
+            file.write(f"Discord name    | GP\n")
+        column_names_dict = await get_date()
+        column_name1 = column_names_dict["column_name1"]
+        role = discord.utils.get(channel.guild.roles, name="Promotions")
+        guild = bot.get_guild(809954021028134943)
+        c.execute(f'''SELECT PM.D_ID, PM.G_ID, PGG.{column_name1}
+        FROM Pretherians_members AS PM
+        JOIN Pretherians_GP_gained AS PGG ON PM.G_ID = PGG.G_ID
+        WHERE PGG.{column_name1} >= 400''')
+        result = c.fetchall()
+        found_any = False
+        for item in result:
+            member = guild.get_member(item[0])
+            GP = item[2]
+            if member is None:
+                print(f"Member with ID {item[0]} not found in guild.")
+                continue
+            if role in member.roles:
+                print(member)
+                found_any = True
+                with open('promo.txt', 'a') as file:
+                    file.write(f"{member.name.ljust(15)} | {GP}\n")
+        if not found_any:
+            print('No members meet the requirements')
+            await channel.send('No members meet the requirements')
+        file = discord.File('promo.txt')
+        await channel.send(file=file)
+        os.remove('promo.txt')
+    except Exception as e:
+        print(f"Error: {e}")
+        await channel.send(f"Error: {e}")
 
 
     
@@ -262,7 +277,7 @@ async def GP_export(email_a, email_p):
 
     ## Configure Firebase
     config = {
-        "apiKey": os.environ.get('FIRE_APIKEY'),
+        "apiKey": os.environ.get('FIRE_API'),
         "authDomain": "idlemmo.firebaseapp.com",
         "databaseURL": "https://idlemmo.firebaseio.com",
         "storageBucket": "idlemmo.appspot.com"
