@@ -305,7 +305,7 @@ async def GP_export(email_a, email_p):
         ## add member list to the database
         df_members_game.to_sql(guild_name+"_game", conn, if_exists='replace')
         
-    conn.commit
+    conn.commit()
     
 async def GP_databases():
     conn = sqlite3.connect('DatabaseLedBot.db')
