@@ -327,22 +327,26 @@ def is_unexpected_command_error(error: Exception) -> bool:
     )
 
 
-def should_run_weekly_gp(now: datetime, last_run_date, hour: int = 2) -> bool:
+def should_run_weekly_gp(now: datetime, already_ran: bool, hour: int = 2) -> bool:
     """Whether the weekly GP job should fire on this tick.
 
     The loop polls local time every 15 minutes rather than using
     tasks.loop(time=...), because a naive time there is interpreted as UTC by
     discord.py while this check and Functions.get_date() both work in local
     time -- on a non-UTC host the two disagreed and the job ran hours from the
-    intended 2 AM. Polling means several ticks land inside the 2 AM hour, so
-    last_run_date (the date of the previous run, or None) makes it idempotent:
-    the job runs once per Saturday, not once per tick.
+    intended 2 AM.
+
+    already_ran must come from persistent storage, not a module global. Several
+    ticks land inside the 2 AM hour, and the bot can restart inside it too --
+    systemd runs it with Restart=on-failure -- so an in-memory marker is lost
+    exactly when it is needed and the whole cycle runs a second time. That is
+    the duplicate weekly report this loop exists to prevent.
     """
     if not is_saturday(now):
         return False
     if now.hour != hour:
         return False
-    return last_run_date != now.date()
+    return not already_ran
 
 
 def is_saturday(dt: datetime) -> bool:
