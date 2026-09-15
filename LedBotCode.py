@@ -29,6 +29,9 @@ GP_prefix = 'GP'
 separator = ' | '
 bot = commands.Bot(command_prefix=prefix, intents=discord.Intents.all())
 LedukasSpam_channelID = int(os.environ.get('SPAM_CHANNEL_ID'))
+# Resolved in on_ready. Defined here so the `is None` guards that read it are
+# correct on their own terms rather than relying on on_ready having run first.
+LedukasSpam_channel = None
 email_a = os.environ.get('EMAIL_A')
 email_p = os.environ.get('EMAIL_P')
 
@@ -610,7 +613,10 @@ async def run_weekly_gp(ack_channel):
         # In a finally because GP_databases above has already written this
         # week's columns. A cycle that failed partway is exactly when a
         # snapshot matters most, so the backup must not be skipped with it.
-        conn.commit()
+        # No conn.commit() here: this module's connection performs no writes
+        # during the cycle. Each writer commits its own -- Functions.GP_export
+        # commits Functions.conn, and GP_databases commits the connection it
+        # opens itself.
         print("weekly GP calculated")
         try:
             backup_path = run_backup()
@@ -650,7 +656,7 @@ async def GP_weekly_man(ctx):
 @tasks.loop(minutes=15)
 async def gp_weekly_loop():
     now = datetime.now()
-    if not logic.is_saturday(now) or now.hour != 2:
+    if not logic.is_weekly_gp_window(now):
         return
 
     if LedukasSpam_channel is None:
