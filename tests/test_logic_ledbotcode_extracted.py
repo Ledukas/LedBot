@@ -232,3 +232,35 @@ class TestShouldRunWeeklyGp:
         """already_ran is keyed on this week's snapshot column, so a new
         Saturday reads as not-yet-run even though last week was."""
         assert logic.should_run_weekly_gp(self.SATURDAY_2AM, False) is True
+
+
+class TestWeeklyGpWindow:
+    """The loop applies is_weekly_gp_window as a cheap per-tick gate and
+    should_run_weekly_gp applies it again before the persistence lookup. These
+    pin that there is only one schedule, so the two cannot drift apart."""
+
+    from datetime import datetime as _dt
+
+    def test_window_matches_the_named_hour(self):
+        saturday = self._dt(2026, 9, 12)
+        for hour in range(24):
+            expected = hour == logic.WEEKLY_GP_HOUR
+            assert logic.is_weekly_gp_window(saturday.replace(hour=hour)) is expected, hour
+
+    def test_window_is_saturday_only(self):
+        from datetime import timedelta
+        saturday_at_hour = self._dt(2026, 9, 12, logic.WEEKLY_GP_HOUR)
+        for offset in range(1, 7):
+            assert logic.is_weekly_gp_window(saturday_at_hour + timedelta(days=offset)) is False
+
+    def test_should_run_never_fires_outside_the_window(self):
+        """If these two ever disagreed, the loop's gate would block the tick
+        should_run_weekly_gp would have accepted, and the job would silently
+        stop running."""
+        from datetime import timedelta
+        start = self._dt(2026, 9, 7)
+        t = start
+        while t < start + timedelta(days=7):
+            if logic.should_run_weekly_gp(t, False):
+                assert logic.is_weekly_gp_window(t) is True, t
+            t += timedelta(minutes=15)

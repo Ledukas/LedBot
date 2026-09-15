@@ -327,7 +327,20 @@ def is_unexpected_command_error(error: Exception) -> bool:
     )
 
 
-def should_run_weekly_gp(now: datetime, already_ran: bool, hour: int = 2) -> bool:
+# The hour the weekly GP job runs, in the host's local time. Written once:
+# the loop needs a cheap gate it can apply on every tick without touching the
+# database, and should_run_weekly_gp needs the same condition, and those two
+# disagreeing silently would stop the job from ever running.
+WEEKLY_GP_HOUR = 2
+
+
+def is_weekly_gp_window(now: datetime) -> bool:
+    """Whether now falls in the weekly job's window: the 2 AM hour of a local
+    Saturday. The cheap half of the gate, with no persistence lookup."""
+    return is_saturday(now) and now.hour == WEEKLY_GP_HOUR
+
+
+def should_run_weekly_gp(now: datetime, already_ran: bool) -> bool:
     """Whether the weekly GP job should fire on this tick.
 
     The loop polls local time every 15 minutes rather than using
@@ -342,9 +355,7 @@ def should_run_weekly_gp(now: datetime, already_ran: bool, hour: int = 2) -> boo
     exactly when it is needed and the whole cycle runs a second time. That is
     the duplicate weekly report this loop exists to prevent.
     """
-    if not is_saturday(now):
-        return False
-    if now.hour != hour:
+    if not is_weekly_gp_window(now):
         return False
     return not already_ran
 
