@@ -1,6 +1,6 @@
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord.ext.commands.bot import Bot
 import pandas as pd
 import sqlite3
@@ -9,12 +9,14 @@ import json
 from dotenv import load_dotenv
 import requests
 import shlex
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 import inspect
 import asyncio
 import random
 
 import Functions
+import logic
+from scripts.backup_db import run_backup
 
 load_dotenv()
 
@@ -86,8 +88,34 @@ async def led_stop(ctx):
     await ctx.send("Shutting down...")
     await bot.logout()
  
+@bot.command(name='wb-now')
+@commands.has_any_role("Aetherians", "Pretherians", "Moderator", "Honorary Aetherian")
+@commands.cooldown(1, 15, commands.BucketType.guild)
+async def wb_now(ctx):
+    try:
+        async with ctx.typing():
+            strategy = await Functions.get_cell_value('B4')
+        
+        await ctx.reply(f'**Current Week Boss Strategy:**\n\n{strategy}')
+    except Exception:
+        await ctx.reply('Error fetching current week boss strategy. Please try again later!')
+        print(Exception)
+
+@bot.command(name='wb-next')
+@commands.has_any_role("Aetherians", "Pretherians", "Moderator", "Honorary Aetherian")
+@commands.cooldown(1, 15, commands.BucketType.guild)
+async def wb_next(ctx):
+    try:
+        async with ctx.typing():
+            strategy = await Functions.get_cell_value('C2')
+        
+        await ctx.reply(f'**Next Week Boss Strategy:**\n\n{strategy}')
+    except Exception:
+        await ctx.reply('Error fetching next week boss strategy. Please try again later!')
+        print(Exception)
+
 @bot.command()
-@commands.has_any_role("Aetherians", "Pretherians", "Moderator")
+@commands.has_any_role("Aetherians", "Pretherians", "Moderator", "Honorary Aetherian")
 @commands.cooldown(1, 15, commands.BucketType.guild)
 async def gemdrop(ctx):
     message = (
@@ -103,18 +131,13 @@ async def gemdrop(ctx):
 @bot.command(name="backup")
 @commands.has_role("Moderator")
 async def export_data(ctx):
-    
+
     try:
-        c = conn.cursor()
-        # Create a backup file
-        date = datetime.now()
-        backup_name = f"Backup_{date.year}_{date.month}_{date.day}"
-        with open(backup_name, 'w', encoding='utf-8') as backup_file:
-            for line in conn.iterdump():
-                backup_file.write('%s\n' % line)
-        await ctx.send("Backup created")
+        backup_path = run_backup()
+        await ctx.send(f"Backup created: `{backup_path.name}`")
     except Exception as e:
         print(e)
+        await ctx.send(f"Backup failed: {e}")
 
 # export members from discord
 @bot.command(name='members_discord')
@@ -216,7 +239,7 @@ async def sync_counters(ctx):
         # Game names, assigned but not in discord
         with open('sync.txt', 'a') as f:
             f.write('\n*Assigned but not in discord:\n')
-        df_assigned_notindisocrd = df_list_discord.loc[~df_list_discord.isin(df_discord)]
+        df_assigned_notindisocrd = logic.find_missing(df_list_discord, df_discord)
         for value in df_assigned_notindisocrd:
             temp = c.execute('SELECT G_ID FROM ' + table_name_members + ' WHERE D_ID = ?', (value,))
             game_id = c.fetchall()
@@ -230,7 +253,7 @@ async def sync_counters(ctx):
         # Discord accounts, assigned but not in game
         with open('sync.txt', 'a') as f:
             f.write('\n*Assigned but not in game:\n')
-        df_assigned_notingame = df_list_game.loc[~df_list_game.isin(df_game)]
+        df_assigned_notingame = logic.find_missing(df_list_game, df_game)
         for value in df_assigned_notingame:
             try:
                 temp = c.execute('SELECT D_ID FROM ' + table_name_members + ' WHERE G_ID = ?', (value,))
@@ -330,12 +353,11 @@ async def invite(ctx, IOguild, InviteName):
     data = json.loads(response.content.decode())
     result_value = data["result"]
     
-    if result_value is None:
-        await ctx.send("Error, invite not sent")
-    elif result_value.lower() == "true":
-        await ctx.send("Invite sent. Let a moderator know when you join")
-    else:
-        await ctx.send("Error, invite not sent")
+    await ctx.send(logic.interpret_action_result(
+        result_value,
+        "Invite sent. Let a moderator know when you join",
+        "Error, invite not sent",
+    ))
     
 #command to kick from guild
 @bot.command(name='kick')
@@ -413,12 +435,11 @@ async def kick(ctx, IOguild, KickID):
     except Exception as e:
         print(e)
     
-    if result_value is None:
-        await ctx.send("Error, not kicked")
-    elif result_value.lower() == "true":
-        await ctx.send(f"{Disp_result} has been kicked from {IOguild}")
-    else:
-        await ctx.send("Error, not kicked")
+    await ctx.send(logic.interpret_action_result(
+        result_value,
+        f"{Disp_result} has been kicked from {IOguild}",
+        "Error, not kicked",
+    ))
 
 # a command to check gains
 @bot.command(name='mygains')
@@ -466,45 +487,21 @@ async def mygains2(IOguild, c, user_did):
     query = f"SELECT G_ID FROM {table_name_members} WHERE D_ID = ?"
     c.execute(query, (user_did,))
     user_gid = c.fetchall()  
-    personal_gains = monthly_gp_df[monthly_gp_df['G_ID'] == user_gid[0][0]]
-    personal_gains = personal_gains.drop('G_ID', axis=1)
-    
-    formatted_data = personal_gains.to_string(index=False)
-    lines = formatted_data.split('\n')
-    formatted_lines = []
-    for line in lines:
-        formatted_line = ' '.join(line.split()).replace(' ', separator)
-        formatted_lines.append(formatted_line)
-    formatted_data = '\n'.join(formatted_lines)
-
-    header = IOguild.ljust(14)
-    for column in personal_gains.columns[1:]:
-        header += separator + column.ljust(7)
-    header += '\n'
-
-    # Construct the data string
-    data = ""
-    for _, row in personal_gains.iterrows():
-        data += row[0].ljust(14)
-        for value in row[1:]:
-            data += separator + str(value).ljust(7)
-        data += '\n'
+    personal_gains = logic.filter_personal_gains(monthly_gp_df, user_gid[0][0])
+    # Header uses the guild name in place of the first column's real name
+    # (e.g. "Name"), matching the original formatting exactly.
+    personal_gains = personal_gains.rename(columns={personal_gains.columns[0]: IOguild})
+    table_block = logic.format_table_block(personal_gains)
 
     user_gid = str(user_gid[0][0])
     query = f"SELECT GP FROM {table_name_game} WHERE G_ID = ?"
     c.execute(query, (user_gid,))
     user_gp = c.fetchall()
 
-    remaining_points = 0
-    for i in range(len(GProles)):
-        if int(user_gp[0][0]) >= GProles[i]:
-            remaining_points = GProles[i - 1] - int(user_gp[0][0])
-            break
-    if remaining_points <0:
-        remaining_points = "You have the final rank"
-    
+    remaining_points = logic.compute_remaining_to_rankup(int(user_gp[0][0]), GProles)
+
     # Send the header and data as a message
-    message = f"```{header}{data}"
+    message = f"```{table_block}"
     if IOguild == 'Aetherians':
         message += f"Total: {str(user_gp[0][0])}    GP needed to rank up: {remaining_points}```"
     elif IOguild == 'Pretherians':
@@ -518,17 +515,24 @@ async def promotions(ctx):
 
 #baba pings
 async def baba_ping():
-    global baba_task
-    guild = bot.get_guild(809954021028134943) 
-    baba_role = discord.utils.get(guild.roles, name="Spiketrap")
-    baba_channel = bot.get_channel(1032916681569349632)
     while True:
-        now = datetime.now()
-        current_time = now.strftime("%H:%M:%S")
-        if now.minute == 57:
-            await baba_channel.send(f"{baba_role.mention} The spiketrap is awaiting your death!")
-            await asyncio.sleep(100)
-        else:
+        try:
+            now = datetime.now()
+            if now.minute == 57:
+                guild = bot.get_guild(809954021028134943)
+                baba_role = discord.utils.get(guild.roles, name="Spiketrap") if guild else None
+                baba_channel = bot.get_channel(1032916681569349632)
+                if guild and baba_role and baba_channel:
+                    await baba_channel.send(f"{baba_role.mention} The spiketrap is awaiting your death!")
+                else:
+                    print("baba_ping: guild/role/channel not found, skipping this hour")
+                await asyncio.sleep(100)
+            else:
+                await asyncio.sleep(40)
+        except Exception as e:
+            # Never let a transient failure (rate limit, cache gap, etc.) kill this loop
+            # permanently -- log it and keep going instead of letting the task die silently.
+            print(f"baba_ping error: {e}")
             await asyncio.sleep(40)
 
 #does weekly GP things
@@ -556,6 +560,16 @@ async def GP_weekly_auto():
     print("weekly GP calculated automatically")
     conn.commit()
 
+    # Data only changes on this weekly cycle, so back it up right after — no need
+    # for a separate always-on schedule (e.g. daily) that would just copy the same
+    # unchanged data most days.
+    try:
+        backup_path = run_backup()
+        await LedukasSpam_channel.send(f"Weekly backup created: `{backup_path.name}`")
+    except Exception as e:
+        print(e)
+        await LedukasSpam_channel.send(f"Weekly backup failed: {e}")
+
 @bot.command(name='GP_weekly')
 @commands.has_role("Moderator")
 async def GP_weekly_man(ctx):
@@ -572,68 +586,60 @@ async def GP_weekly_man(ctx):
     IOguild = "Pretherians"
     monthly_gp_df = await Functions.GP_dataframe(IOguild)
     await Functions.red_gp(LedukasSpam_channel, monthly_gp_df, IOguild)
-    
+
     conn.commit()
+
+    try:
+        backup_path = run_backup()
+        await LedukasSpam_channel.send(f"Weekly backup created: `{backup_path.name}`")
+    except Exception as e:
+        print(e)
+        await LedukasSpam_channel.send(f"Weekly backup failed: {e}")
 
 
 
 ##---------------------------------------------  Functions
 
-async def run_at_specific_time():
-    while True:
-        
-        now = datetime.now()
-        # Check if it's Saturday at 2 AM
-        if now.weekday() == 5 and now.hour == 2 and now.minute == 0:
-            await GP_weekly_auto()
-            await asyncio.sleep(5000)    
-
-        # Calculate the time until the next Saturday at 2 AM
-        days_until_saturday = (5 - now.weekday()) % 7
-        time_until_2_am = timedelta(hours=2) - timedelta(hours=now.hour, minutes=now.minute, seconds=now.second)
-        total_time_until_next_run = timedelta(days=days_until_saturday) + time_until_2_am
-        
-        # Sleep until the next run time (Saturday at 2 AM)
-        await asyncio.sleep(total_time_until_next_run.total_seconds())
+# Runs once every 24h at 2 AM local time; only actually does anything on Saturdays.
+# Using tasks.loop (instead of a hand-rolled while-loop spawned via bot.loop.create_task)
+# means the task has a proper start()/is_running() lifecycle, so a gateway reconnect
+# re-firing on_ready can't silently spawn a second, duplicate copy of this loop
+# (which is what used to cause the weekly GP report getting sent twice).
+@tasks.loop(time=time(hour=2, minute=0))
+async def gp_weekly_loop():
+    if not logic.is_saturday(datetime.now()):
+        return
+    await GP_weekly_auto()
 
 ##---------------------------------------------  Errors
 # error messages for all commands
 @assign.error
 async def assign_error(ctx, error):
-    if isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send("Missing required argument. Please provide all the necessary parameters.")
-    elif isinstance(error, commands.CommandInvokeError):
-        await ctx.send(f"An error occurred while processing the command: {error.original}")
-    elif isinstance(error, commands.UserNotFound):
-        await ctx.send("User not found.")
-    else:
-        await ctx.send("Command error")
+    await ctx.send(logic.assign_error_message(error))
 @bot.event
 async def on_command_error(ctx, error):
-    if isinstance(error, commands.MissingRole):
-        await ctx.send("You don't have the required permissions to use this command.")
-    elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send("Missing an argument!")
-    elif isinstance(error, commands.BotMissingPermissions):
-        await ctx.send("The bot doesn't have the required permissions to run this command.")
-    elif isinstance(error, commands.UserInputError):
-        await ctx.send("There was an error in the input.")
-    elif isinstance(error, commands.CommandOnCooldown):
-        pass
-        
+    message = logic.command_error_message(error)
+    if message is not None:
+        await ctx.send(message)
+
         
 baba_task = None
 # gives a message in console once the bot goes live
 @bot.event
 async def on_ready():
+    global baba_task
     print(f'Logged in with {bot.user.name} | {bot.user.id}')
     if baba_task is None:
+        baba_task = 1
         bot.loop.create_task(baba_ping())
-    bot.loop.create_task(run_at_specific_time())
+    if not gp_weekly_loop.is_running():
+        gp_weekly_loop.start()
     global LedukasSpam_channel
     LedukasSpam_channel = bot.get_channel(LedukasSpam_channelID)
     
     await load_cogs()
-bot.run(TOKEN)
 
-conn.close
+if __name__ == "__main__":
+    bot.run(TOKEN)
+
+    conn.close
