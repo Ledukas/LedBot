@@ -133,12 +133,55 @@ class TestCommandErrorMessage:
         error = commands.CommandOnCooldown(None, 5.0, None)
         assert logic.command_error_message(error) is None
 
-    def test_unhandled_exception_type_sends_nothing(self):
-        """Pins a known, not-yet-fixed gap (see TODO.md): there is no
-        catch-all branch, so any exception type not explicitly listed above
-        silently produces no message at all -- same as today's behavior,
-        deliberately not fixed as a side effect of adding this test."""
-        assert logic.command_error_message(ValueError("some unexpected error")) is None
+    def test_missing_any_role(self):
+        """has_any_role raises MissingAnyRole, which is NOT a subclass of
+        MissingRole -- so wb-now/wb-next/gemdrop used to fall through to the
+        silent default whenever an unauthorized user tried them."""
+        error = commands.MissingAnyRole(["Aetherians", "Pretherians"])
+        assert logic.command_error_message(error) == (
+            "You don't have the required permissions to use this command."
+        )
+
+    def test_command_not_found_sends_nothing(self):
+        """A mistyped command name must stay silent, otherwise the bot would
+        reply to every stray message beginning with the prefix."""
+        assert logic.command_error_message(commands.CommandNotFound()) is None
+
+    def test_unhandled_exception_type_gets_generic_message(self):
+        """Previously returned None, so any command without its own .error
+        handler failed with no Discord reply and no log line at all."""
+        assert (
+            logic.command_error_message(ValueError("some unexpected error"))
+            == logic.UNEXPECTED_ERROR_MESSAGE
+        )
+
+    def test_command_invoke_error_gets_generic_message(self):
+        """The wrapper discord.py puts around anything raised inside a command
+        body -- the single most common real failure, and previously silent."""
+        error = commands.CommandInvokeError(TypeError("'NoneType' is not subscriptable"))
+        assert logic.command_error_message(error) == logic.UNEXPECTED_ERROR_MESSAGE
+
+
+class TestIsUnexpectedCommandError:
+    @pytest.mark.parametrize("error", [
+        commands.MissingRole("Moderator"),
+        commands.MissingAnyRole(["Aetherians"]),
+        commands.BotMissingPermissions(["manage_roles"]),
+        commands.UserInputError("bad input"),
+        commands.CommandOnCooldown(None, 5.0, None),
+        commands.CommandNotFound(),
+    ])
+    def test_anticipated_errors_are_not_logged(self, error):
+        assert logic.is_unexpected_command_error(error) is False
+
+    @pytest.mark.parametrize("error", [
+        ValueError("boom"),
+        TypeError("'NoneType' object is not subscriptable"),
+        IndexError("list index out of range"),
+        commands.CommandInvokeError(RuntimeError("boom")),
+    ])
+    def test_real_bugs_are_logged(self, error):
+        assert logic.is_unexpected_command_error(error) is True
 
 
 class TestIsSaturday:
