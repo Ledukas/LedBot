@@ -104,7 +104,7 @@ async def get_date():
 
 #get the dataframe
 async def GP_dataframe(IOguild):
-    table_name_gained = IOguild+'_GP_gained'
+    table_name_gained = logic.table_name(IOguild, 'GP_gained')
     
     column_names_dict = await get_date()
     column_names = column_names_dict["column_names"]
@@ -122,9 +122,11 @@ async def GP_dataframe(IOguild):
 
 #GP roles and clammies for Aetherians
 async def GP_roles(bot, monthly_gp_df):
-    c.execute('''SELECT Aetherians_members.D_ID, Aetherians_game.GP 
-                FROM Aetherians_game JOIN Aetherians_members 
-                ON Aetherians_game.G_ID = Aetherians_members.G_ID''')
+    members_table = logic.table_name(logic.RANK_ROLE_GUILD, 'members')
+    game_table = logic.table_name(logic.RANK_ROLE_GUILD, 'game')
+    c.execute(f'''SELECT {members_table}.D_ID, {game_table}.GP
+                FROM {game_table} JOIN {members_table}
+                ON {game_table}.G_ID = {members_table}.G_ID''')
     result = c.fetchall()
     guild = bot.get_guild(809954021028134943)
     for row in result:
@@ -171,7 +173,7 @@ async def GP_roles(bot, monthly_gp_df):
     sync_ducks = aeth_duck is not None and booster_duck is not None
     if not sync_ducks:
         print("'Aetherian Duck' or 'Booster (For DUCK)' does not exist, skipping the duck pairing")
-    query = f"SELECT D_ID FROM Aetherians_members WHERE G_ID IN ({','.join(['?']*len(list_clammies))})"
+    query = f"SELECT D_ID FROM {members_table} WHERE G_ID IN ({','.join(['?']*len(list_clammies))})"
     cursor = c.execute(query, list_clammies)
     rows = cursor.fetchall()
     d_ids = [row[0] for row in rows]
@@ -230,10 +232,12 @@ async def promotions(bot, channel):
         column_name1 = column_names_dict["column_name1"]
         role = discord.utils.get(channel.guild.roles, name="Promotions")
         guild = bot.get_guild(809954021028134943)
+        promo_members = logic.table_name(logic.PROMOTION_GUILD, 'members')
+        promo_gained = logic.table_name(logic.PROMOTION_GUILD, 'GP_gained')
         c.execute(f'''SELECT PM.D_ID, PM.G_ID, PGG.{column_name1}
-        FROM Pretherians_members AS PM
-        JOIN Pretherians_GP_gained AS PGG ON PM.G_ID = PGG.G_ID
-        WHERE PGG.{column_name1} >= 400''')
+        FROM {promo_members} AS PM
+        JOIN {promo_gained} AS PGG ON PM.G_ID = PGG.G_ID
+        WHERE PGG.{column_name1} >= {logic.PROMOTION_GP_REQUIREMENT}''')
         result = c.fetchall()
         found_any = False
         for item in result:
@@ -261,15 +265,10 @@ async def promotions(bot, channel):
     
 async def GP_export(email_a, email_p):
 
+    emails = {"Aetherians": email_a, "Pretherians": email_p}
     guilds_data = {
-        "Aetherians": {
-            "gid": "jSiitSSM7nO0HFuoVlsa",
-            "email": email_a
-        },
-        "Pretherians": {
-            "gid": "yuFnrJvPfK8ZdfFXHojg",
-            "email": email_p
-        }
+        name: {"gid": gid, "email": emails[name]}
+        for name, gid in logic.GUILD_GIDS.items()
     }
 
     ## Configure Firebase
@@ -303,7 +302,7 @@ async def GP_export(email_a, email_p):
         df_members_game = pd.DataFrame(rows)
 
         ## add member list to the database
-        df_members_game.to_sql(guild_name+"_game", conn, if_exists='replace')
+        df_members_game.to_sql(logic.table_name(guild_name, 'game'), conn, if_exists='replace')
         
     conn.commit()
     
@@ -312,19 +311,15 @@ async def GP_databases():
     conn.execute("PRAGMA journal_mode=WAL")
     c = conn.cursor()
 
-    IOguild = {}
-    IOguild[1] = "Aetherians"
-    IOguild[2] = "Pretherians"
-
     column_names_dict = await get_date()
     column_name1 = column_names_dict["column_name1"]
     column_name2 = column_names_dict["column_name2"]
 
-    for item in IOguild:
+    for guild_name in logic.GUILD_NAMES:
 
-        table_name_GP = IOguild[item]+'_GP'
-        table_name_game = IOguild[item]+'_game'
-        table_name_gained = IOguild[item]+'_GP_gained'
+        table_name_GP = logic.table_name(guild_name, 'GP')
+        table_name_game = logic.table_name(guild_name, 'game')
+        table_name_gained = logic.table_name(guild_name, 'GP_gained')
     
         #fills the GP table with total GP
         c.execute(f"PRAGMA table_info({table_name_GP})")

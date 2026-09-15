@@ -219,3 +219,29 @@ class TestRankThresholdConstants:
         gap reported is exactly the distance to the rank that threshold grants."""
         for threshold, _ in logic.RANK_THRESHOLDS[:-1]:
             assert logic.compute_remaining_to_rankup(threshold - 1, logic.GP_THRESHOLDS) == 1
+
+
+class TestGuildConfig:
+    def test_table_name_builds_expected_names(self):
+        assert logic.table_name("Aetherians", "members") == "Aetherians_members"
+        assert logic.table_name("Pretherians", "GP_gained") == "Pretherians_GP_gained"
+
+    def test_unknown_guild_is_rejected(self):
+        """IOguild is whatever a moderator typed, and it is interpolated
+        directly into SQL because a table name cannot be a bound parameter."""
+        with pytest.raises(ValueError):
+            logic.table_name("Robert'); DROP TABLE members;--", "members")
+
+    def test_unknown_table_kind_is_rejected(self):
+        with pytest.raises(ValueError):
+            logic.table_name("Aetherians", "not_a_table")
+
+    def test_every_guild_has_a_red_gp_threshold(self):
+        assert set(logic.RED_GP_THRESHOLDS) == set(logic.GUILD_NAMES)
+
+    def test_asymmetric_guilds_are_real_guilds(self):
+        assert logic.RANK_ROLE_GUILD in logic.GUILD_NAMES
+        assert logic.PROMOTION_GUILD in logic.GUILD_NAMES
+
+    def test_guild_names_match_the_gid_table(self):
+        assert set(logic.GUILD_NAMES) == set(logic.GUILD_GIDS)
