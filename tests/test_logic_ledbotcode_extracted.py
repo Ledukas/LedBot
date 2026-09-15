@@ -196,3 +196,40 @@ class TestIsSaturday:
         dt = monday + timedelta(days=weekday)
         assert dt.weekday() == weekday
         assert logic.is_saturday(dt) == expected
+
+
+class TestShouldRunWeeklyGp:
+    """The loop polls local time every 15 minutes, so these pin both halves:
+    it fires in the 2 AM hour on a Saturday, and only once per Saturday."""
+
+    from datetime import datetime as _dt
+
+    SATURDAY_2AM = _dt(2026, 9, 12, 2, 0)
+
+    def test_fires_on_saturday_at_two(self):
+        assert logic.should_run_weekly_gp(self.SATURDAY_2AM, None) is True
+
+    def test_does_not_fire_on_other_days(self):
+        from datetime import timedelta
+        for offset in range(1, 7):
+            day = self.SATURDAY_2AM + timedelta(days=offset)
+            assert logic.should_run_weekly_gp(day, None) is False, day
+
+    def test_does_not_fire_at_other_hours(self):
+        for hour in (0, 1, 3, 12, 21, 23):
+            when = self.SATURDAY_2AM.replace(hour=hour)
+            assert logic.should_run_weekly_gp(when, None) is False, hour
+
+    def test_only_runs_once_per_saturday(self):
+        """Every tick inside the 2 AM hour would otherwise re-run the job --
+        the duplicate weekly report this loop was rewritten to prevent."""
+        assert logic.should_run_weekly_gp(self.SATURDAY_2AM, None) is True
+        already = self.SATURDAY_2AM.date()
+        for minute in (0, 15, 30, 45):
+            when = self.SATURDAY_2AM.replace(minute=minute)
+            assert logic.should_run_weekly_gp(when, already) is False, minute
+
+    def test_runs_again_the_following_saturday(self):
+        from datetime import timedelta
+        last_week = (self.SATURDAY_2AM - timedelta(days=7)).date()
+        assert logic.should_run_weekly_gp(self.SATURDAY_2AM, last_week) is True

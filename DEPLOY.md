@@ -38,6 +38,8 @@ sudo systemctl restart ledbot.service
 
 ## Backups
 
-The database only changes once a week (the Saturday 2 AM GP job), so backups are triggered from inside that same job rather than on a separate always-on schedule — `run_weekly_gp()` calls `scripts/backup_db.run_backup()` right after committing that week's data and posts a confirmation (or failure) to the mod channel, no SSH needed to check. A mod can also trigger an on-demand backup any time via the `!backup` Discord command.
+> The weekly job fires at 2 AM **in the Pi's local timezone**, so make sure the Pi's clock and timezone are set correctly (`timedatectl`). The GP snapshot columns are named after the local date, so a wrong timezone shifts which day a week's gains are attributed to.
+
+The database only changes once a week (the Saturday 2 AM local-time GP job), so backups are triggered from inside that same job rather than on a separate always-on schedule — `run_weekly_gp()` calls `scripts/backup_db.run_backup()` right after committing that week's data and posts a confirmation (or failure) to the mod channel, no SSH needed to check. A mod can also trigger an on-demand backup any time via the `!backup` Discord command.
 
 Backups land in `Backups/` as timestamped `.db` snapshots; `scripts/backup_db.py` keeps the most recent 52 (about a year at weekly cadence) and prunes older ones automatically (see `--retention` to change that). It's also runnable directly by hand if ever needed: `venv/bin/python3 scripts/backup_db.py`.

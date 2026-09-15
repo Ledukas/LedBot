@@ -114,11 +114,11 @@ async def GP_dataframe(IOguild):
     cursor = conn.execute(query)
     rows = cursor.fetchall()
 
-    try:
-        monthly_gp_df = logic.build_gp_dataframe(rows, column_names, column_names_int, GP_prefix)
-    except Exception as e:
-        print("line: " + str(inspect.currentframe().f_lineno) + "\nError: " + str(e))
-    return monthly_gp_df
+    # Deliberately not wrapped in try/except: this used to catch, print, and
+    # then fall through to `return monthly_gp_df`, which was never bound on the
+    # failure path, so the caller got an UnboundLocalError instead of the real
+    # error. Let it propagate to the caller, which reports it.
+    return logic.build_gp_dataframe(rows, column_names, column_names_int, GP_prefix)
 
 #GP roles and clammies for Aetherians
 async def GP_roles(bot, monthly_gp_df):
@@ -129,6 +129,11 @@ async def GP_roles(bot, monthly_gp_df):
                 ON {game_table}.G_ID = {members_table}.G_ID''')
     result = c.fetchall()
     guild = bot.get_guild(809954021028134943)
+    if guild is None:
+        # Every role lookup below hangs off this; without the check they all
+        # fail with an unhelpful AttributeError on None.
+        print("GP_roles: Discord server not in cache, skipping the role sync")
+        return
     for row in result:
         D_ID = row[0]
         GP = row[1]
@@ -159,7 +164,12 @@ async def GP_roles(bot, monthly_gp_df):
                 else:
                     await member.remove_roles(role2remove)
 
-    monthly_gp_df.dropna(inplace=True)
+    # Rebind rather than dropna(inplace=True): this dataframe belongs to the
+    # caller, which passes the same object on to red_gp afterwards. Mutating it
+    # here dropped every row with an NA in any column from the low-GP report --
+    # so a member who joined less than three weeks ago, and therefore has no
+    # value in the oldest snapshot column, was silently never flagged.
+    monthly_gp_df = monthly_gp_df.dropna()
     df_clammies = logic.filter_top_average(monthly_gp_df)
     list_clammies = df_clammies['G_ID'].tolist()
     clammy = discord.utils.get(guild.roles, name = 'Monthly Top')
@@ -232,6 +242,9 @@ async def promotions(bot, channel):
         column_name1 = column_names_dict["column_name1"]
         role = discord.utils.get(channel.guild.roles, name="Promotions")
         guild = bot.get_guild(809954021028134943)
+        if guild is None:
+            await channel.send("Discord server not in cache, cannot check promotions right now.")
+            return
         promo_members = logic.table_name(logic.PROMOTION_GUILD, 'members')
         promo_gained = logic.table_name(logic.PROMOTION_GUILD, 'GP_gained')
         c.execute(f'''SELECT PM.D_ID, PM.G_ID, PGG.{column_name1}
