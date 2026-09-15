@@ -270,6 +270,11 @@ def is_saturday(dt: datetime) -> bool:
 # Extracted from cogs/giveaway.py
 # ---------------------------------------------------------------------------
 
+class GiveawayArgumentError(ValueError):
+    """The giveaway arguments cannot be resolved into a guild filter plus a GP
+    requirement. Carries a message written to be shown straight to the mod."""
+
+
 def resolve_giveaway_args(
     guild_name: str | None,
     gp_required: int | None,
@@ -277,19 +282,34 @@ def resolve_giveaway_args(
     """Resolve the !giveaway command's overloaded guild_name/gp_required args.
 
     A bare numeric third argument (e.g. `!giveaway <msg> #chan 500`) is
-    reinterpreted as a GP requirement with no guild filter. If neither is
-    given, gp_required defaults to 0 (no minimum). Note: if a guild name IS
-    given but gp_required is not, gp_required is returned unchanged as None
-    (not defaulted to 0) -- this matches the original behavior faithfully,
-    though it means the caller's SQL GP filter ends up comparing against
-    NULL in that case, which is a pre-existing quirk, not something this
-    extraction changes.
+    reinterpreted as a GP requirement with no guild filter. With neither given,
+    gp_required defaults to 0, meaning no minimum.
+
+    Naming a guild without a GP requirement raises GiveawayArgumentError. It
+    used to leave gp_required as None, which the caller's SQL then compared
+    against as NULL -- never true for any row -- so naming a guild silently
+    disqualified every participant. Requiring the number is a deliberate choice
+    over quietly defaulting it: for a giveaway, an argument that silently
+    changes who can win is worse than one that asks the mod to be explicit.
     """
     if gp_required is None and guild_name and guild_name.isdigit():
         gp_required = int(guild_name)
         guild_name = None
-    if gp_required is None and guild_name is None:
-        gp_required = 0
+
+    # "" arrives from an empty quoted argument. Downstream it is falsy and means
+    # "both guilds", so normalize it to None rather than letting it through as a
+    # guild name that matches nothing.
+    if not guild_name:
+        if gp_required is None:
+            gp_required = 0
+        return None, gp_required
+
+    if gp_required is None:
+        raise GiveawayArgumentError(
+            f"Give a GP requirement when you name a guild, for example "
+            f"`!giveaway <message id> #channel {guild_name} 500`. Use 0 for no minimum."
+        )
+
     return guild_name, gp_required
 
 

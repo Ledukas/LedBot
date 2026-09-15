@@ -24,7 +24,10 @@ CREDS = Credentials.from_service_account_file(
     )
 
 load_dotenv()
+# WAL lets the weekly job and a moderator command touch the database at the
+# same moment without hitting "database is locked".
 conn = sqlite3.connect('DatabaseLedBot.db')
+conn.execute("PRAGMA journal_mode=WAL")
 c = conn.cursor()
 password = os.environ.get('PASSWORD')
 
@@ -155,6 +158,9 @@ async def GP_roles(bot, monthly_gp_df):
             continue
 
         role2give = discord.utils.get(guild.roles, name=target_role_name)
+        if role2give is None:
+            print(f"Role '{target_role_name}' does not exist in the Discord server, skipping")
+            continue
         if role2give not in member.roles:
             await member.add_roles(role2give)
             # Only remove the immediately-adjacent lower rank (promotion-only sync,
@@ -162,8 +168,12 @@ async def GP_roles(bot, monthly_gp_df):
             # GP has dropped, and doesn't strip every other rank role they hold).
             target_index = RANK_ROLE_NAMES.index(target_role_name)
             if target_index > 0:
-                role2remove = discord.utils.get(guild.roles, name=RANK_ROLE_NAMES[target_index - 1])
-                await member.remove_roles(role2remove)
+                lower_rank_name = RANK_ROLE_NAMES[target_index - 1]
+                role2remove = discord.utils.get(guild.roles, name=lower_rank_name)
+                if role2remove is None:
+                    print(f"Role '{lower_rank_name}' does not exist, leaving it in place")
+                else:
+                    await member.remove_roles(role2remove)
 
     monthly_gp_df.dropna(inplace=True)
     df_clammies = logic.filter_top_average(monthly_gp_df)
@@ -171,6 +181,14 @@ async def GP_roles(bot, monthly_gp_df):
     clammy = discord.utils.get(guild.roles, name = 'Monthly Top')
     aeth_duck = discord.utils.get(guild.roles, name = 'Aetherian Duck')
     booster_duck = discord.utils.get(guild.roles, name = 'Booster (For DUCK)')
+    if clammy is None:
+        print("Role 'Monthly Top' does not exist in the Discord server, skipping the Monthly Top sync")
+        return
+    # The duck pairing only makes sense when both roles resolve; without this,
+    # a missing 'Aetherian Duck' would reach add_roles(None) and crash.
+    sync_ducks = aeth_duck is not None and booster_duck is not None
+    if not sync_ducks:
+        print("'Aetherian Duck' or 'Booster (For DUCK)' does not exist, skipping the duck pairing")
     query = f"SELECT D_ID FROM Aetherians_members WHERE G_ID IN ({','.join(['?']*len(list_clammies))})"
     cursor = c.execute(query, list_clammies)
     rows = cursor.fetchall()
@@ -181,7 +199,7 @@ async def GP_roles(bot, monthly_gp_df):
     for member in members_with_clammy:
         if member.id not in d_ids:
             await member.remove_roles(clammy)
-            if booster_duck in member.roles:
+            if sync_ducks and booster_duck in member.roles:
                 await member.remove_roles(aeth_duck)
 
     #give clammy
@@ -193,7 +211,7 @@ async def GP_roles(bot, monthly_gp_df):
             continue
         if clammy not in member.roles:
             await member.add_roles(clammy)
-            if booster_duck in member.roles:
+            if sync_ducks and booster_duck in member.roles:
                 await member.add_roles(aeth_duck)
                 
 #red GP
@@ -309,6 +327,7 @@ async def GP_export(email_a, email_p):
     
 async def GP_databases():
     conn = sqlite3.connect('DatabaseLedBot.db')
+    conn.execute("PRAGMA journal_mode=WAL")
     c = conn.cursor()
 
     IOguild = {}
