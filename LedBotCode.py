@@ -585,30 +585,45 @@ async def run_weekly_gp(ack_channel):
     of them was updated.
     """
     print("Starting weekly GP process")
+
+    # Mark the week before doing any work, so a restart mid-cycle cannot run it
+    # again, and so a manual !GP_weekly suppresses the scheduled run.
+    run_key = (await Functions.get_date())["column_name1"]
+    await Functions.mark_weekly_run_started(run_key)
+
     await members_guild(ack_channel)
     await Functions.GP_databases()
 
-    for guild_name in logic.GUILD_NAMES:
-        monthly_gp_df = await Functions.GP_dataframe(guild_name)
-        # Only one guild runs the GP rank ladder and the Monthly Top role.
-        if guild_name == logic.RANK_ROLE_GUILD:
-            await Functions.GP_roles(bot, monthly_gp_df)
-            await LedukasSpam_channel.send("GP roles fixed!")
-        await Functions.red_gp(LedukasSpam_channel, monthly_gp_df, guild_name)
-    #await Functions.promotions(bot, LedukasSpam_channel)
-
-    conn.commit()
-    print("weekly GP calculated")
-
-    # Data only changes on this weekly cycle, so back it up right after. A
-    # separate always-on schedule would just copy the same unchanged data most
-    # days.
     try:
-        backup_path = run_backup()
-        await LedukasSpam_channel.send(f"Weekly backup created: `{backup_path.name}`")
-    except Exception as e:
-        print(e)
-        await LedukasSpam_channel.send(f"Weekly backup failed: {e}")
+        for guild_name in logic.GUILD_NAMES:
+            monthly_gp_df = await Functions.GP_dataframe(guild_name)
+            # Only one guild runs the GP rank ladder and the Monthly Top role.
+            if guild_name == logic.RANK_ROLE_GUILD:
+                roles_status = await Functions.GP_roles(bot, monthly_gp_df)
+                if roles_status is None:
+                    await LedukasSpam_channel.send("GP roles fixed!")
+                else:
+                    await LedukasSpam_channel.send(f"GP roles not fully synced: {roles_status}")
+            await Functions.red_gp(LedukasSpam_channel, monthly_gp_df, guild_name)
+        #await Functions.promotions(bot, LedukasSpam_channel)
+    finally:
+        # In a finally because GP_databases above has already written this
+        # week's columns. A cycle that failed partway is exactly when a
+        # snapshot matters most, so the backup must not be skipped with it.
+        conn.commit()
+        print("weekly GP calculated")
+        try:
+            backup_path = run_backup()
+            backup_message = f"Weekly backup created: `{backup_path.name}`"
+        except Exception as e:
+            print(e)
+            backup_message = f"Weekly backup failed: {e}"
+        # Nothing in this finally may raise: an exception here would replace the
+        # one that brought us into it and hide why the cycle actually failed.
+        try:
+            await LedukasSpam_channel.send(backup_message)
+        except Exception as e:
+            print(f"could not report backup status: {e}", file=sys.stderr)
 
 
 @bot.command(name='GP_weekly')
@@ -632,16 +647,21 @@ async def GP_weekly_man(ctx):
 # tasks.loop is still what runs it, for its start()/is_running() lifecycle: a
 # gateway reconnect re-firing on_ready cannot spawn a second copy, which is what
 # used to send the weekly report twice.
-_last_weekly_run_date = None
-
-
 @tasks.loop(minutes=15)
 async def gp_weekly_loop():
-    global _last_weekly_run_date
     now = datetime.now()
-    if not logic.should_run_weekly_gp(now, _last_weekly_run_date):
+    if not logic.is_saturday(now) or now.hour != 2:
         return
-    _last_weekly_run_date = now.date()
+
+    if LedukasSpam_channel is None:
+        # Return before marking the week so a later tick can still run it once
+        # the channel is cached.
+        print("gp_weekly_loop: mod channel not available, skipping this tick", file=sys.stderr)
+        return
+
+    run_key = (await Functions.get_date())["column_name1"]
+    if not logic.should_run_weekly_gp(now, await Functions.weekly_run_already_started(run_key)):
+        return
 
     # Without this, any exception escaping run_weekly_gp stops the task for
     # good -- discord.ext.tasks does not reschedule after an unhandled error --
@@ -653,7 +673,10 @@ async def gp_weekly_loop():
         print(f"weekly GP job failed: {e}", file=sys.stderr)
         traceback.print_exception(type(e), e, e.__traceback__)
         try:
-            await LedukasSpam_channel.send(f"Weekly GP job failed: {e}")
+            await LedukasSpam_channel.send(
+                f"Weekly GP job failed: {e}. It will not retry automatically -- "
+                f"run !GP_weekly once the cause is fixed."
+            )
         except Exception as send_error:
             print(f"could not report weekly GP failure: {send_error}", file=sys.stderr)
 
@@ -692,10 +715,14 @@ async def on_ready():
     if baba_task is None:
         baba_task = 1
         bot.loop.create_task(baba_ping())
-    if not gp_weekly_loop.is_running():
-        gp_weekly_loop.start()
     global LedukasSpam_channel
     LedukasSpam_channel = bot.get_channel(LedukasSpam_channelID)
+    if LedukasSpam_channel is None:
+        print(f"WARNING: mod channel {LedukasSpam_channelID} not found; the weekly GP job cannot report")
+    # Started only after the channel it writes to is resolved: an interval loop
+    # runs its body immediately on start().
+    if not gp_weekly_loop.is_running():
+        gp_weekly_loop.start()
     
     await load_cogs()
 

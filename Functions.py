@@ -102,6 +102,49 @@ async def get_date():
     
     return column_names_dict
 
+WEEKLY_RUNS_TABLE = 'weekly_runs'
+
+
+def _ensure_weekly_runs_table():
+    c.execute(
+        f"CREATE TABLE IF NOT EXISTS {WEEKLY_RUNS_TABLE} "
+        "(run_key TEXT PRIMARY KEY, started_at TEXT)"
+    )
+    conn.commit()
+
+
+async def weekly_run_already_started(run_key: str) -> bool:
+    """Whether the weekly cycle has already been started for this GP week.
+
+    Kept in the database rather than in memory because the bot restarts: a
+    module global is lost on restart, and systemd runs the bot with
+    Restart=on-failure, so a crash during the 2 AM job would restart inside the
+    same hour and run the whole cycle again -- the duplicate weekly report all
+    over again, and potentially in a loop.
+    """
+    _ensure_weekly_runs_table()
+    row = c.execute(
+        f"SELECT 1 FROM {WEEKLY_RUNS_TABLE} WHERE run_key = ?", (run_key,)
+    ).fetchone()
+    return row is not None
+
+
+async def mark_weekly_run_started(run_key: str) -> None:
+    """Record that this GP week's cycle has been started.
+
+    Deliberately recorded at the start, not on success: it caps the automatic
+    run at one attempt per week, so a repeatable failure cannot turn into a
+    restart loop. A failed run is reported to the mod channel, and a moderator
+    re-runs it with !GP_weekly.
+    """
+    _ensure_weekly_runs_table()
+    c.execute(
+        f"INSERT OR REPLACE INTO {WEEKLY_RUNS_TABLE} (run_key, started_at) VALUES (?, ?)",
+        (run_key, datetime.now().isoformat(timespec='seconds')),
+    )
+    conn.commit()
+
+
 #get the dataframe
 async def GP_dataframe(IOguild):
     table_name_gained = logic.table_name(IOguild, 'GP_gained')
@@ -122,6 +165,12 @@ async def GP_dataframe(IOguild):
 
 #GP roles and clammies for Aetherians
 async def GP_roles(bot, monthly_gp_df):
+    """Sync Aetherian rank roles and the Monthly Top role.
+
+    Returns None when the sync completed, or a short reason string when it was
+    skipped or only partly done, so the caller does not announce success for
+    work that did not happen.
+    """
     members_table = logic.table_name(logic.RANK_ROLE_GUILD, 'members')
     game_table = logic.table_name(logic.RANK_ROLE_GUILD, 'game')
     c.execute(f'''SELECT {members_table}.D_ID, {game_table}.GP
@@ -133,7 +182,7 @@ async def GP_roles(bot, monthly_gp_df):
         # Every role lookup below hangs off this; without the check they all
         # fail with an unhelpful AttributeError on None.
         print("GP_roles: Discord server not in cache, skipping the role sync")
-        return
+        return "the Discord server was not in cache"
     for row in result:
         D_ID = row[0]
         GP = row[1]
@@ -177,7 +226,7 @@ async def GP_roles(bot, monthly_gp_df):
     booster_duck = discord.utils.get(guild.roles, name = 'Booster (For DUCK)')
     if clammy is None:
         print("Role 'Monthly Top' does not exist in the Discord server, skipping the Monthly Top sync")
-        return
+        return "rank roles were synced, but the 'Monthly Top' role does not exist"
     # The duck pairing only makes sense when both roles resolve; without this,
     # a missing 'Aetherian Duck' would reach add_roles(None) and crash.
     sync_ducks = aeth_duck is not None and booster_duck is not None
@@ -207,6 +256,10 @@ async def GP_roles(bot, monthly_gp_df):
             await member.add_roles(clammy)
             if sync_ducks and booster_duck in member.roles:
                 await member.add_roles(aeth_duck)
+
+    if not sync_ducks:
+        return "roles were synced, but the duck pairing was skipped (a duck role is missing)"
+    return None
                 
 #red GP
 async def red_gp(channel, monthly_gp_df, IOguild):
