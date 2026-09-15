@@ -42,12 +42,10 @@ conn.execute("PRAGMA journal_mode=WAL")
 df_members_game = None
 
 roles_to_remove = {
-    # Both guild roles plus every rank below the top one. Set-identical to the
-    # list this replaced: 'True Aetherian' was absent there and stays absent
-    # here, so a kicked top-rank member keeps that role. That looks like an
-    # oversight rather than intent, but changing it changes what kick does, so
-    # it is recorded in TODO.md as a decision rather than fixed in passing.
-    'removeroles': list(logic.GUILD_NAMES) + logic.RANK_ROLE_NAMES[:-1],
+    # Both guild roles plus every rank role, top one included. 'True Aetherian'
+    # used to be omitted here, so a kicked top-rank member kept it while every
+    # other rank lost theirs; that was an oversight, not intent.
+    'removeroles': list(logic.GUILD_NAMES) + logic.RANK_ROLE_NAMES,
     'giverole': 'Former Aetherian',
 }
 
