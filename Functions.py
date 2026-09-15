@@ -4,8 +4,24 @@ import sqlite3
 import inspect
 import discord
 import os
+import re
 from dotenv import load_dotenv
 import pyrebase
+import aiohttp
+import json
+import time
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from google.oauth2.service_account import Credentials
+import asyncio
+
+import logic
+
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+CREDS = Credentials.from_service_account_file(
+    "service_account.json",
+    scopes=SCOPES
+    )
 
 load_dotenv()
 conn = sqlite3.connect('DatabaseLedBot.db')
@@ -23,6 +39,51 @@ role_5_titan = 25000
 role_6_primordial = 50000
 role_7_true = 100000
 GProles = [role_6_primordial, role_5_titan, role_4_deity, role_3_demigod, role_2_hero, role_1_knight, role_7_true]
+RANK_THRESHOLDS = [
+    (role_1_knight, 'Aetherian Knight'),
+    (role_2_hero, 'Aetherian Hero'),
+    (role_3_demigod, 'Aetherian Demigod'),
+    (role_4_deity, 'Aetherian Deity'),
+    (role_5_titan, 'Aetherian Titan'),
+    (role_6_primordial, 'Aetherian Primordial'),
+    (role_7_true, 'True Aetherian'),
+]
+RANK_ROLE_NAMES = [name for _, name in RANK_THRESHOLDS]
+
+
+WB_sheet_name = os.environ.get('WB_SHEET_NAME')
+WB_spreadsheet_id = os.environ.get('WB_SPREADSHEET_ID')
+GOOGLE_API_KEY = os.getenv('GOOGLESHEETS_API')
+service = build('sheets', 'v4', developerKey=GOOGLE_API_KEY, cache_discovery=False)
+
+def _sync_fetch_cell(spreadsheet_id: str, sheet_name: str, cell: str):
+    """Blocking Google API call (runs in thread)."""
+    service = build("sheets", "v4", credentials=CREDS)
+    range_name = f"{sheet_name}!{cell}"
+
+    result = service.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id,
+        range=range_name,
+        valueRenderOption="FORMATTED_VALUE",
+        dateTimeRenderOption="FORMATTED_STRING"
+    ).execute()
+
+    values = result.get("values", [])
+    return logic.extract_cell_value(values)
+
+async def get_cell_value(cell: str) -> str:
+    try:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None,
+            _sync_fetch_cell,
+            WB_spreadsheet_id,
+            WB_sheet_name,
+            cell
+        )
+    except Exception as error:
+        print(f"Error fetching cell value: {error}")
+        return "Failed to fetch boss strategy from spreadsheet"
 
 #get date
 async def get_date():
@@ -67,20 +128,9 @@ async def GP_dataframe(IOguild):
     query = f"SELECT {', '.join(column_names)} FROM {table_name_gained}"
     cursor = conn.execute(query)
     rows = cursor.fetchall()
-    monthly_gp_df = pd.DataFrame(rows, columns=column_names)
-    
-    for column in column_names_int:
-        monthly_gp_df[column] = pd.to_numeric(monthly_gp_df[column], errors='coerce')
-    monthly_gp_df[column_names_int] = monthly_gp_df[column_names_int].fillna(pd.NA).astype('Int64')
-    
-    new_column_names = {column: column.replace('GP2025_', '') for column in column_names_int}
-    monthly_gp_df = monthly_gp_df.rename(columns=new_column_names)
-    
+
     try:
-        monthly_gp_df['Average'] = monthly_gp_df.iloc[:, 2:].mean(axis=1)
-        monthly_gp_df['Average'] = monthly_gp_df['Average'].replace('NAType', pd.NA)
-        monthly_gp_df['Average'] = pd.to_numeric(monthly_gp_df['Average'], errors='coerce')
-        monthly_gp_df['Average'] = monthly_gp_df['Average'].round(1)
+        monthly_gp_df = logic.build_gp_dataframe(rows, column_names, column_names_int, GP_prefix)
     except Exception as e:
         print("line: " + str(inspect.currentframe().f_lineno) + "\nError: " + str(e))
     return monthly_gp_df
@@ -99,56 +149,24 @@ async def GP_roles(bot, monthly_gp_df):
 
         if member is None:
             continue
-        
-        if GP > role_1_knight and GP < role_2_hero:
-            role2give = discord.utils.get(guild.roles, name='Aetherian Knight')
-            if role2give not in member.roles:
-                await member.add_roles(role2give)
 
-        elif GP > role_2_hero and GP < role_3_demigod:
-            role2give = discord.utils.get(guild.roles, name = 'Aetherian Hero')
-            if role2give not in member.roles:
-                await member.add_roles(role2give)
-                role2remove = discord.utils.get(guild.roles, name = 'Aetherian Knight')
-                await member.remove_roles(role2remove)
+        target_role_name = logic.compute_gp_rank_role(GP, RANK_THRESHOLDS)
+        if target_role_name is None:
+            continue
 
-        elif GP > role_3_demigod and GP < role_4_deity:
-            role2give = discord.utils.get(guild.roles, name = 'Aetherian Demigod')
-            if role2give not in member.roles:
-                await member.add_roles(role2give)
-                role2remove = discord.utils.get(guild.roles, name = 'Aetherian Hero')
+        role2give = discord.utils.get(guild.roles, name=target_role_name)
+        if role2give not in member.roles:
+            await member.add_roles(role2give)
+            # Only remove the immediately-adjacent lower rank (promotion-only sync,
+            # matching the original behavior -- this doesn't demote members whose
+            # GP has dropped, and doesn't strip every other rank role they hold).
+            target_index = RANK_ROLE_NAMES.index(target_role_name)
+            if target_index > 0:
+                role2remove = discord.utils.get(guild.roles, name=RANK_ROLE_NAMES[target_index - 1])
                 await member.remove_roles(role2remove)
 
-        elif GP > role_4_deity and GP < role_5_titan:
-            role2give = discord.utils.get(guild.roles, name = 'Aetherian Deity')
-            if role2give not in member.roles:
-                await member.add_roles(role2give)
-                role2remove = discord.utils.get(guild.roles, name = 'Aetherian Demigod')
-                await member.remove_roles(role2remove)
-
-        elif GP > role_5_titan and GP < role_6_primordial:
-            role2give = discord.utils.get(guild.roles, name = 'Aetherian Titan')
-            if role2give not in member.roles:
-                await member.add_roles(role2give)
-                role2remove = discord.utils.get(guild.roles, name = 'Aetherian Deity')
-                await member.remove_roles(role2remove)
-
-        elif GP > role_6_primordial and GP < role_7_true:
-            role2give = discord.utils.get(guild.roles, name = 'Aetherian Primordial')
-            if role2give not in member.roles:
-                await member.add_roles(role2give)
-                role2remove = discord.utils.get(guild.roles, name = 'Aetherian Titan')
-                await member.remove_roles(role2remove)
-        
-        elif GP > role_7_true:
-            role2give = discord.utils.get(guild.roles, name = 'True Aetherian')
-            if role2give not in member.roles:
-                await member.add_roles(role2give)
-                role2remove = discord.utils.get(guild.roles, name = 'Aetherian Primordial')
-                await member.remove_roles(role2remove)
-                
     monthly_gp_df.dropna(inplace=True)
-    df_clammies = monthly_gp_df[monthly_gp_df['Average'] > 649]
+    df_clammies = logic.filter_top_average(monthly_gp_df)
     list_clammies = df_clammies['G_ID'].tolist()
     clammy = discord.utils.get(guild.roles, name = 'Monthly Top')
     aeth_duck = discord.utils.get(guild.roles, name = 'Aetherian Duck')
@@ -169,6 +187,10 @@ async def GP_roles(bot, monthly_gp_df):
     #give clammy
     for d_id in d_ids:
         member = guild.get_member(d_id)
+        print(member)
+        if member is None:
+            print("member is None, error. Skipping")
+            continue
         if clammy not in member.roles:
             await member.add_roles(clammy)
             if booster_duck in member.roles:
@@ -176,50 +198,25 @@ async def GP_roles(bot, monthly_gp_df):
                 
 #red GP
 async def red_gp(channel, monthly_gp_df, IOguild):
-    
-    if IOguild == 'Aetherians':
-        redGP = 400
-    elif IOguild == 'Pretherians':
-        redGP = 140
 
+    Blacklist = [
+        'bvK1B5ngXtgiw5MV95mE6BOP2rN2', #Ledukas, Aetherians
+        '0dzrUrtCeOdllJBa8LXoYQCo4Fv1', #Ledukas, Pretherians
+        '4EwZK8w84gR6ESP0YAjiXeP03n62', #Led-Bot, Aetherians
+        'TQvhMJ1oAIfRXrvffVGN3Jy0Zdi1' #Led_Bot, Pretherians
+        ]
     try:
-        Blacklist = [
-            'bvK1B5ngXtgiw5MV95mE6BOP2rN2', #Ledukas, Aetherians
-            '0dzrUrtCeOdllJBa8LXoYQCo4Fv1', #Ledukas, Pretherians
-            '4EwZK8w84gR6ESP0YAjiXeP03n62', #Led-Bot, Aetherians
-            'TQvhMJ1oAIfRXrvffVGN3Jy0Zdi1' #Led_Bot, Pretherians
-            ]
-        df_red_gp = monthly_gp_df[monthly_gp_df.iloc[:, 5] < redGP]
-        df_red_gp = df_red_gp.dropna(subset=df_red_gp.columns[4])
-        df_red_gp = df_red_gp[~df_red_gp['G_ID'].isin(Blacklist)]
-        df_red_gp = df_red_gp.drop('G_ID', axis=1)
-        df_red_gp = df_red_gp.sort_values(df_red_gp.columns[4])
+        df_red_gp = logic.filter_red_gp(monthly_gp_df, IOguild, Blacklist)
     except Exception as e:
+        # Bails out cleanly here instead of continuing on with an undefined
+        # df_red_gp, which is what the old version did on any failure here.
         print("line: " + str(inspect.currentframe().f_lineno) + "\n error: " + str(e))
+        await channel.send(f"Error building red-GP report: {e}")
+        return
 
-    # Convert dataframe to a formatted string
-    formatted_data = df_red_gp.to_string(index=False)
-
-    # Modify the string to align columns
-    lines = formatted_data.split('\n')
-    formatted_lines = []
-    for line in lines:
-        formatted_line = ' '.join(line.split()).replace(' ', separator)
-        formatted_lines.append(formatted_line)
-    formatted_data = '\n'.join(formatted_lines)
-    
     with open('red.txt', 'w') as file:
         file.write(f'{IOguild} \n')
-        file.write(df_red_gp.columns.to_list()[0].ljust(14))  # Write the first column header
-        for column in df_red_gp.columns[1:]:
-            file.write(separator + column.ljust(7))  # Write the remaining column headers
-        file.write('\n')
-
-        for _, row in df_red_gp.iterrows():
-            file.write(row[0].ljust(14))  # Write the first column values
-            for value in row[1:]:
-                file.write(separator + str(value).ljust(7))  # Write the remaining column values
-            file.write('\n')
+        file.write(logic.format_table_block(df_red_gp))
 
     file = discord.File('red.txt')
     await channel.send(file=file)
@@ -301,17 +298,8 @@ async def GP_export(email_a, email_p):
         ref = db.child("_guild").child(guild_attributes["gid"]).child("m")
         # Stream changes and register the stream handler
         data = ref.get(token=id_token).val()
-        
-        rows = []
-        # Iterate over the members in the event data
-        for member_id, member_data in data.items():
-            # Extract the required fields ('a' and 'e') for each member
-            a_value = member_data['a']
-            e_value = member_data['e']
-            
-            # Create a new row with the values
-            new_row = {'G_NAME': a_value, 'G_ID': member_id, 'GP': e_value}
-            rows.append(new_row)
+
+        rows = logic.build_game_members_rows(data)
         df_members_game = pd.DataFrame(rows)
 
         ## add member list to the database

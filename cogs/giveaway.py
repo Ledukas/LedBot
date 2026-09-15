@@ -6,6 +6,8 @@ import sqlite3
 from datetime import datetime, timedelta
 import json
 
+import logic
+
 WINNERS_FILE = "winners.json"
 
 class Giveaway(commands.Cog):
@@ -35,13 +37,9 @@ class Giveaway(commands.Cog):
             winners = []
                 
         try:
-            if gp_required is None and guild_name and guild_name.isdigit():
-                gp_required = int(guild_name)
-                guild_name = None
-            if gp_required is None and guild_name is None:
-                gp_required = 0
-            
-            
+            guild_name, gp_required = logic.resolve_giveaway_args(guild_name, gp_required)
+
+
             today = datetime.now()
             last_saturday = today - timedelta(days=(today.weekday() + 2) % 7)
             gp_column = f"GP{last_saturday.year}_{last_saturday.month:02}_{last_saturday.day:02}"
@@ -85,10 +83,11 @@ class Giveaway(commands.Cog):
                             final_participants.append(participant)
                             
             print(f"Final participants: {[p.name for p in final_participants]}")
-            eligible_participants = [p for p in final_participants if p.id not in winners]
+            eligible_participants = logic.filter_eligible_participants(final_participants, winners)
             print(f"Eligible participants: {eligible_participants}")
             if not eligible_participants:
                 await ctx.send("No eligible participants found.")
+                return
             winner = random.choice(eligible_participants)
             winners.append(winner.id)
             with open(WINNERS_FILE, "w") as f:
