@@ -1,0 +1,17 @@
+[Unit]
+Description=LedBot Discord bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# EDIT these two before installing: the account the bot should run as,
+# and the absolute path where you cloned this repo on the Pi.
+User=pi
+WorkingDirectory=/home/pi/LedBot
+ExecStart=/home/pi/LedBot/venv/bin/python3 /home/pi/LedBot/LedBotCode.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
