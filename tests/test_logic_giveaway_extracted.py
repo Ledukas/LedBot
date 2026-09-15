@@ -62,3 +62,19 @@ class TestFilterEligibleParticipants:
 
     def test_empty_participants(self):
         assert logic.filter_eligible_participants([], winners=[1, 2]) == []
+
+
+class TestResolveGiveawayArgsGuildValidation:
+    def test_misspelled_guild_is_rejected_with_the_valid_names(self):
+        """Previously reached logic.table_name() and came back to the mod as a
+        raw "Unrecognized guild" ValueError string."""
+        with pytest.raises(logic.GiveawayArgumentError) as excinfo:
+            logic.resolve_giveaway_args("Aetherianz", 500)
+        message = str(excinfo.value)
+        assert "Aetherianz" in message
+        for name in logic.GUILD_NAMES:
+            assert name in message
+
+    def test_every_real_guild_is_accepted(self):
+        for name in logic.GUILD_NAMES:
+            assert logic.resolve_giveaway_args(name, 0) == (name, 0)

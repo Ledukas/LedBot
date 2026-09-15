@@ -327,6 +327,24 @@ def is_unexpected_command_error(error: Exception) -> bool:
     )
 
 
+def should_run_weekly_gp(now: datetime, last_run_date, hour: int = 2) -> bool:
+    """Whether the weekly GP job should fire on this tick.
+
+    The loop polls local time every 15 minutes rather than using
+    tasks.loop(time=...), because a naive time there is interpreted as UTC by
+    discord.py while this check and Functions.get_date() both work in local
+    time -- on a non-UTC host the two disagreed and the job ran hours from the
+    intended 2 AM. Polling means several ticks land inside the 2 AM hour, so
+    last_run_date (the date of the previous run, or None) makes it idempotent:
+    the job runs once per Saturday, not once per tick.
+    """
+    if not is_saturday(now):
+        return False
+    if now.hour != hour:
+        return False
+    return last_run_date != now.date()
+
+
 def is_saturday(dt: datetime) -> bool:
     """Pins the "5 = Saturday" convention used by the weekly GP job."""
     return dt.weekday() == 5
@@ -369,6 +387,14 @@ def resolve_giveaway_args(
         if gp_required is None:
             gp_required = 0
         return None, gp_required
+
+    # Validate the guild here rather than letting a typo reach table_name() and
+    # surface as a raw ValueError string. This function is where giveaway
+    # arguments are resolved, so it is where they should be checked.
+    if guild_name not in GUILD_GIDS:
+        raise GiveawayArgumentError(
+            f"'{guild_name}' is not one of our guilds. Use one of: {', '.join(GUILD_NAMES)}."
+        )
 
     if gp_required is None:
         raise GiveawayArgumentError(

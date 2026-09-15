@@ -434,31 +434,43 @@ async def kick(ctx, IOguild, KickID):
     Disp_result = c.fetchall()
     Disp_result = Disp_result[0][0]
     
-    if guild:
-        member = guild.get_member(int(KickID))
-
-        if member:
-            print(f"Found member to kick: {Disp_result}")
-        else:
-            print("Member not found.")
+    # The in-game kick has already happened at this point. The Discord role
+    # cleanup below is a separate step that can fail on its own, and it used to
+    # fail into a bare print while the moderator was still told the kick had
+    # fully succeeded -- so a member could be removed in game yet silently keep
+    # every Discord role. Track it and say so instead.
+    role_warning = None
+    if guild is None:
+        role_warning = "the Discord server was not in cache"
     else:
-        print("Guild not found.")
-    try:
-        role2give = discord.utils.get(guild.roles, name='Former Aetherian')
-        await member.add_roles(role2give)
-        
-        for role in roles_to_remove['removeroles']:
-            role2remove = discord.utils.get(guild.roles, name=role)
-            if role2remove in member.roles:
-                await member.remove_roles(role2remove)
-    except Exception as e:
-        print(e)
-    
-    await ctx.send(logic.interpret_action_result(
+        member = guild.get_member(int(KickID))
+        if member is None:
+            role_warning = f"{Disp_result} was not found in the Discord server"
+        else:
+            print(f"Found member to kick: {Disp_result}")
+            try:
+                role2give = discord.utils.get(guild.roles, name=roles_to_remove['giverole'])
+                if role2give is None:
+                    role_warning = f"the '{roles_to_remove['giverole']}' role does not exist"
+                else:
+                    await member.add_roles(role2give)
+
+                for role in roles_to_remove['removeroles']:
+                    role2remove = discord.utils.get(guild.roles, name=role)
+                    if role2remove is not None and role2remove in member.roles:
+                        await member.remove_roles(role2remove)
+            except Exception as e:
+                print(e)
+                role_warning = str(e)
+
+    message = logic.interpret_action_result(
         result_value,
         f"{Disp_result} has been kicked from {IOguild}",
         "Error, not kicked",
-    ))
+    )
+    if role_warning:
+        message += " (Discord roles were not updated: " + role_warning + ")"
+    await ctx.send(message)
 
 # a command to check gains
 @bot.command(name='mygains')
@@ -497,7 +509,16 @@ async def mygains2(IOguild, c, user_did):
     monthly_gp_df = await Functions.GP_dataframe(IOguild)
     query = f"SELECT G_ID FROM {table_name_members} WHERE D_ID = ?"
     c.execute(query, (user_did,))
-    user_gid = c.fetchall()  
+    user_gid = c.fetchall()
+    # mygains decides membership from {guild}_discord, which is a different
+    # population from {guild}_members: holding the Discord role does not mean
+    # anyone has linked an in-game name yet. sync_counters exists to list
+    # exactly these people, so this is a normal state, not a broken one.
+    if not user_gid:
+        return (
+            f"You have the {IOguild} role but no in-game name linked yet -- "
+            f"ask a moderator to run !assign for you."
+        )
     personal_gains = logic.filter_personal_gains(monthly_gp_df, user_gid[0][0])
     # Header uses the guild name in place of the first column's real name
     # (e.g. "Name"), matching the original formatting exactly.
@@ -508,6 +529,11 @@ async def mygains2(IOguild, c, user_did):
     query = f"SELECT GP FROM {table_name_game} WHERE G_ID = ?"
     c.execute(query, (user_gid,))
     user_gp = c.fetchall()
+    if not user_gp:
+        return (
+            f"No current {IOguild} in-game data found for your linked name -- "
+            f"you may no longer be in the guild in game."
+        )
 
     remaining_points = logic.compute_remaining_to_rankup(int(user_gp[0][0]), logic.GP_THRESHOLDS)
 
@@ -593,16 +619,43 @@ async def GP_weekly_man(ctx):
 
 ##---------------------------------------------  Functions
 
-# Runs once every 24h at 2 AM local time; only actually does anything on Saturdays.
-# Using tasks.loop (instead of a hand-rolled while-loop spawned via bot.loop.create_task)
-# means the task has a proper start()/is_running() lifecycle, so a gateway reconnect
-# re-firing on_ready can't silently spawn a second, duplicate copy of this loop
-# (which is what used to cause the weekly GP report getting sent twice).
-@tasks.loop(time=time(hour=2, minute=0))
+# Ticks every 15 minutes and acts only in the 2 AM hour on a local-time
+# Saturday. It does NOT use tasks.loop(time=...): a naive datetime.time there is
+# interpreted as UTC by discord.py, while this guard and Functions.get_date()
+# both work in local time, so on any machine not set to UTC the two disagreed
+# and the job ran hours away from the intended 2 AM -- on a UTC-5 host, Saturday
+# 21:00 local. Polling local time keeps the schedule consistent with the dates
+# the snapshot columns are named after, and stays correct across DST, which a
+# fixed UTC offset captured at import would not.
+#
+# _last_weekly_run_date makes the several ticks inside the 2 AM hour idempotent.
+# tasks.loop is still what runs it, for its start()/is_running() lifecycle: a
+# gateway reconnect re-firing on_ready cannot spawn a second copy, which is what
+# used to send the weekly report twice.
+_last_weekly_run_date = None
+
+
+@tasks.loop(minutes=15)
 async def gp_weekly_loop():
-    if not logic.is_saturday(datetime.now()):
+    global _last_weekly_run_date
+    now = datetime.now()
+    if not logic.should_run_weekly_gp(now, _last_weekly_run_date):
         return
-    await run_weekly_gp(LedukasSpam_channel)
+    _last_weekly_run_date = now.date()
+
+    # Without this, any exception escaping run_weekly_gp stops the task for
+    # good -- discord.ext.tasks does not reschedule after an unhandled error --
+    # and the only sign would be a missing weekly report. Same permanent-death
+    # mode baba_ping was hardened against.
+    try:
+        await run_weekly_gp(LedukasSpam_channel)
+    except Exception as e:
+        print(f"weekly GP job failed: {e}", file=sys.stderr)
+        traceback.print_exception(type(e), e, e.__traceback__)
+        try:
+            await LedukasSpam_channel.send(f"Weekly GP job failed: {e}")
+        except Exception as send_error:
+            print(f"could not report weekly GP failure: {send_error}", file=sys.stderr)
 
 ##---------------------------------------------  Errors
 # error messages for all commands
