@@ -88,7 +88,7 @@ async def test(ctx):
 async def led_stop(ctx):
     print("Shutting down...")
     await ctx.send("Shutting down...")
-    await bot.logout()
+    await bot.close()
  
 @bot.command(name='wb-now')
 @commands.has_any_role("Aetherians", "Pretherians", "Moderator", "Honorary Aetherian")
@@ -99,9 +99,9 @@ async def wb_now(ctx):
             strategy = await Functions.get_cell_value('B4')
         
         await ctx.reply(f'**Current Week Boss Strategy:**\n\n{strategy}')
-    except Exception:
+    except Exception as e:
         await ctx.reply('Error fetching current week boss strategy. Please try again later!')
-        print(Exception)
+        print(f"wb-now failed: {e}")
 
 @bot.command(name='wb-next')
 @commands.has_any_role("Aetherians", "Pretherians", "Moderator", "Honorary Aetherian")
@@ -112,9 +112,9 @@ async def wb_next(ctx):
             strategy = await Functions.get_cell_value('C2')
         
         await ctx.reply(f'**Next Week Boss Strategy:**\n\n{strategy}')
-    except Exception:
+    except Exception as e:
         await ctx.reply('Error fetching next week boss strategy. Please try again later!')
-        print(Exception)
+        print(f"wb-next failed: {e}")
 
 @bot.command()
 @commands.has_any_role("Aetherians", "Pretherians", "Moderator", "Honorary Aetherian")
@@ -193,6 +193,8 @@ async def sync_counters(ctx):
             rows = c.fetchall()
         except Exception as e:
             print("line: " + str(inspect.currentframe().f_lineno) + "\n error: " + str(e))
+            await ctx.send(f"Could not read {table_name_discord}: {e}")
+            return
         sync_discord_list = []
         for row in rows:
             try:
@@ -262,6 +264,7 @@ async def sync_counters(ctx):
                 discord_id = c.fetchall()
             except Exception as e:
                 print("line: " + str(inspect.currentframe().f_lineno) + "\n error: " + str(e))
+                continue
             for value in discord_id:
                 temp = c.execute('SELECT Display from ' + table_name_discord + ' WHERE D_ID = ?', value)
                 discord_name = c.fetchall()
@@ -290,6 +293,10 @@ async def assign(ctx, IOguild, user_param, game_name):
 
     if user:
         
+        if IOguild not in guilds_data:
+            await ctx.send(f"'{IOguild}' is not one of our guilds. Use: {', '.join(guilds_data)}")
+            return
+
         input_string = ctx.message.content
         args = shlex.split(input_string)
         game_name = args[3]
@@ -298,6 +305,12 @@ async def assign(ctx, IOguild, user_param, game_name):
         
         c = conn.cursor()
         game = c.execute('SELECT * FROM ' + table_name_game + ' WHERE G_NAME = ?', (game_name,)).fetchone()
+        if game is None:
+            await ctx.send(
+                f"No in-game member named '{game_name}' found in {IOguild}. "
+                f"Check the spelling, or run !members_game first if they only just joined."
+            )
+            return
         c.execute('INSERT INTO ' + table_name_members + ' (Discord, D_ID, Display, G_ID, G_NAME) VALUES (?,?,?,?,?)',
                     (user.name + '#' + user.discriminator, user.id, user.display_name, game[2], game[1]))
 
@@ -399,6 +412,9 @@ async def kick(ctx, IOguild, KickID):
     c = conn.cursor()
     c.execute(f"SELECT G_ID FROM {table_name_members} WHERE D_ID = ?", (KickID,))
     resultUID = c.fetchall()
+    if not resultUID:
+        await ctx.send(f"No member with Discord ID {KickID} is assigned in {IOguild}.")
+        return
     resultUID = resultUID[0][0]
     guildData = {
         "data": {
@@ -658,4 +674,4 @@ async def on_ready():
 if __name__ == "__main__":
     bot.run(TOKEN)
 
-    conn.close
+    conn.close()
