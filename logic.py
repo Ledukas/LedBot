@@ -30,6 +30,48 @@ from discord.ext import commands
 # changed in only one file would have had the bot quoting one scale and
 # assigning on another, with nothing raising an error. Both are derived from
 # this single table now, so they cannot disagree.
+# The two IdleOn guilds. The Discord role name matches the guild name exactly,
+# which is what members_discord relies on when it looks the role up.
+GUILD_GIDS = {
+    "Aetherians": "jSiitSSM7nO0HFuoVlsa",
+    "Pretherians": "yuFnrJvPfK8ZdfFXHojg",
+}
+GUILD_NAMES = tuple(GUILD_GIDS)
+
+# Two deliberate asymmetries between the guilds, named rather than left as bare
+# literals so it is clear they are domain facts and not oversights: only
+# Aetherians has the GP rank ladder and the Monthly Top role, and promotions
+# run from Pretherians into Aetherians.
+RANK_ROLE_GUILD = "Aetherians"
+PROMOTION_GUILD = "Pretherians"
+
+# The GP-gained bar a Pretherian must clear to be listed for promotion. Equal
+# to the Aetherian red-GP threshold today, but a separate rule -- do not derive
+# one from the other, or changing the activity report would silently move the
+# promotion bar too.
+PROMOTION_GP_REQUIREMENT = 400
+
+# Each guild owns one table per kind, named "{guild}_{kind}".
+TABLE_KINDS = ('members', 'discord', 'game', 'GP', 'GP_gained')
+
+
+def table_name(guild_name: str, kind: str) -> str:
+    """Build a per-guild table name, validating both halves.
+
+    A table name cannot be passed as a SQL parameter, so every caller
+    interpolates the guild name straight into the query string. Routing that
+    through here is what keeps an arbitrary command argument -- IOguild comes
+    from whatever a moderator typed -- out of the SQL, and it replaces the
+    f-string and string-concatenation spellings that were scattered across
+    LedBotCode.py, Functions.py and cogs/giveaway.py.
+    """
+    if guild_name not in GUILD_GIDS:
+        raise ValueError(f"Unrecognized guild: {guild_name!r}")
+    if kind not in TABLE_KINDS:
+        raise ValueError(f"Unrecognized table kind: {kind!r}")
+    return f"{guild_name}_{kind}"
+
+
 RANK_THRESHOLDS: list[tuple[int, str]] = [
     (1000, 'Aetherian Knight'),
     (2500, 'Aetherian Hero'),

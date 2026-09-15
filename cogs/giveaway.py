@@ -51,7 +51,7 @@ class Giveaway(commands.Cog):
             users = [user async for user in reaction.users() if not user.bot]
 
             # If no guild specified, treat it as if both guilds are selected
-            guild_names = [guild_name] if guild_name else ["Aetherians", "Pretherians"]
+            guild_names = [guild_name] if guild_name else list(logic.GUILD_NAMES)
             print("test7")
             final_participants = []
             for guild in guild_names:
@@ -63,13 +63,13 @@ class Giveaway(commands.Cog):
                 print("test8")
                 participant_ids = [member.id for member in filtered_users]
                 
-                members_table = f"{guild}_members"
+                members_table = logic.table_name(guild, 'members')
                 query1 = f"SELECT * FROM {members_table} WHERE D_ID IN ({','.join(['?' for _ in participant_ids])})"
                 c.execute(query1, participant_ids)
                 members_results = c.fetchall()
                 g_ids = [row[4] for row in members_results]
                 print("test9")
-                gp_table = f"{guild}_GP_gained"
+                gp_table = logic.table_name(guild, 'GP_gained')
                 query2 = f"SELECT * FROM {gp_table} WHERE G_ID IN ({','.join(['?' for _ in g_ids])}) AND {gp_column} IS NOT NULL AND CAST({gp_column} AS INTEGER) >= ?"
                 c.execute(query2, g_ids + [gp_required])
                 gp_results = c.fetchall()

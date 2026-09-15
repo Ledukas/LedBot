@@ -42,20 +42,21 @@ conn.execute("PRAGMA journal_mode=WAL")
 df_members_game = None
 
 roles_to_remove = {
-    'removeroles': ['Pretherians', 'Aetherians', 'Aetherian Knight', 'Aetherian Hero', 'Aetherian Demigod', 'Aetherian Deity', 'Aetherian Titan', 'Aetherian Primordial'],
+    # Both guild roles plus every rank below the top one. Set-identical to the
+    # list this replaced: 'True Aetherian' was absent there and stays absent
+    # here, so a kicked top-rank member keeps that role. That looks like an
+    # oversight rather than intent, but changing it changes what kick does, so
+    # it is recorded in TODO.md as a decision rather than fixed in passing.
+    'removeroles': list(logic.GUILD_NAMES) + logic.RANK_ROLE_NAMES[:-1],
     'giverole': 'Former Aetherian',
 }
 
+# Only the email mapping is local -- the guild ids live in logic.GUILD_GIDS.
+guild_emails = {"Aetherians": email_a, "Pretherians": email_p}
 guilds_data = {
-    "Aetherians": {
-        "gid": "jSiitSSM7nO0HFuoVlsa",
-        "email": email_a
-        },
-    "Pretherians": {
-        "gid": "yuFnrJvPfK8ZdfFXHojg",
-        "email": email_p
-        }
-    }
+    name: {"gid": gid, "email": guild_emails[name]}
+    for name, gid in logic.GUILD_GIDS.items()
+}
 
 # Load cogs
 async def load_cogs():
@@ -87,7 +88,7 @@ async def led_stop(ctx):
     await bot.close()
  
 @bot.command(name='wb-now')
-@commands.has_any_role("Aetherians", "Pretherians", "Moderator", "Honorary Aetherian")
+@commands.has_any_role(*logic.GUILD_NAMES, "Moderator", "Honorary Aetherian")
 @commands.cooldown(1, 15, commands.BucketType.guild)
 async def wb_now(ctx):
     try:
@@ -100,7 +101,7 @@ async def wb_now(ctx):
         print(f"wb-now failed: {e}")
 
 @bot.command(name='wb-next')
-@commands.has_any_role("Aetherians", "Pretherians", "Moderator", "Honorary Aetherian")
+@commands.has_any_role(*logic.GUILD_NAMES, "Moderator", "Honorary Aetherian")
 @commands.cooldown(1, 15, commands.BucketType.guild)
 async def wb_next(ctx):
     try:
@@ -113,7 +114,7 @@ async def wb_next(ctx):
         print(f"wb-next failed: {e}")
 
 @bot.command()
-@commands.has_any_role("Aetherians", "Pretherians", "Moderator", "Honorary Aetherian")
+@commands.has_any_role(*logic.GUILD_NAMES, "Moderator", "Honorary Aetherian")
 @commands.cooldown(1, 15, commands.BucketType.guild)
 async def gemdrop(ctx):
     message = (
@@ -154,7 +155,7 @@ async def members_discord(ctx):
                 'Display': [member.display_name for member in role_members],}
         df = pd.DataFrame(data)
         # store the data in a database
-        df.to_sql(guild_name+"_discord", conn, if_exists='replace')
+        df.to_sql(logic.table_name(guild_name, 'discord'), conn, if_exists='replace')
         conn.commit()
     await ctx.send("Discord members exported")
 
@@ -175,9 +176,9 @@ async def sync_counters(ctx):
     
     for guild_name in guilds_data.keys():  
     
-        table_name_members = guild_name+'_members'
-        table_name_discord = guild_name+'_discord'
-        table_name_game = guild_name+'_game'
+        table_name_members = logic.table_name(guild_name, 'members')
+        table_name_discord = logic.table_name(guild_name, 'discord')
+        table_name_game = logic.table_name(guild_name, 'game')
 
         # Discord names for assigning
         with open('sync.txt', 'w') as f:
@@ -296,8 +297,8 @@ async def assign(ctx, IOguild, user_param, game_name):
         input_string = ctx.message.content
         args = shlex.split(input_string)
         game_name = args[3]
-        table_name_members = IOguild+'_members'
-        table_name_game = IOguild+'_game'
+        table_name_members = logic.table_name(IOguild, 'members')
+        table_name_game = logic.table_name(IOguild, 'game')
         
         c = conn.cursor()
         game = c.execute('SELECT * FROM ' + table_name_game + ' WHERE G_NAME = ?', (game_name,)).fetchone()
@@ -409,7 +410,7 @@ async def kick(ctx, IOguild, KickID):
         return
 
     # kick
-    table_name_members = IOguild+'_members'
+    table_name_members = logic.table_name(IOguild, 'members')
     
     c = conn.cursor()
     c.execute(f"SELECT G_ID FROM {table_name_members} WHERE D_ID = ?", (KickID,))
@@ -471,37 +472,29 @@ async def mygains(ctx):
     c = conn.cursor()
     user_did = ctx.author.id
     
-    c.execute("SELECT * FROM Aetherians_discord WHERE D_ID = ?", (str(user_did),))
-    result_aetherians = c.fetchone()
+    # One message per guild the member belongs to, in GUILD_NAMES order. This
+    # was four hand-written branches covering every combination of two guilds.
+    memberships = []
+    for guild_name in logic.GUILD_NAMES:
+        c.execute(
+            f"SELECT * FROM {logic.table_name(guild_name, 'discord')} WHERE D_ID = ?",
+            (str(user_did),),
+        )
+        if c.fetchone() is not None:
+            memberships.append(guild_name)
 
-    c.execute("SELECT * FROM Pretherians_discord WHERE D_ID = ?", (str(user_did),))
-    result_pretherians = c.fetchone()
-
-    if result_aetherians == None and result_pretherians == None:
+    if not memberships:
         print("No GP gains recorded")
-        message = "No GP gains recorded yet"
-        await ctx.send(message)
-    elif result_aetherians and not result_pretherians:
-        IOguild = "Aetherians"
-        message = await mygains2(IOguild, c, user_did)
-        await ctx.send(message)
-    elif not result_aetherians and result_pretherians:
-        IOguild = "Pretherians"
-        message = await mygains2(IOguild, c, user_did)
-        await ctx.send(message)
-    else:
-        IOguild_aetherians = "Aetherians"
-        message_aetherians = await mygains2(IOguild_aetherians, c, user_did)
-        await ctx.send(message_aetherians)
-        
-        IOguild_pretherians = "Pretherians"
-        message_pretherians = await mygains2(IOguild_pretherians, c, user_did)
-        await ctx.send(message_pretherians)   
+        await ctx.send("No GP gains recorded yet")
+        return
+
+    for guild_name in memberships:
+        await ctx.send(await mygains2(guild_name, c, user_did))
 
 async def mygains2(IOguild, c, user_did):
     
-    table_name_members = IOguild+'_members'
-    table_name_game = IOguild+'_game'
+    table_name_members = logic.table_name(IOguild, 'members')
+    table_name_game = logic.table_name(IOguild, 'game')
     
     monthly_gp_df = await Functions.GP_dataframe(IOguild)
     query = f"SELECT G_ID FROM {table_name_members} WHERE D_ID = ?"
@@ -522,9 +515,9 @@ async def mygains2(IOguild, c, user_did):
 
     # Send the header and data as a message
     message = f"```{table_block}"
-    if IOguild == 'Aetherians':
+    if IOguild == logic.RANK_ROLE_GUILD:
         message += f"Total: {str(user_gp[0][0])}    GP needed to rank up: {remaining_points}```"
-    elif IOguild == 'Pretherians':
+    else:
         message += f"Total: {str(user_gp[0][0])}```"
     return message
 
@@ -571,15 +564,13 @@ async def run_weekly_gp(ack_channel):
     await members_guild(ack_channel)
     await Functions.GP_databases()
 
-    IOguild = "Aetherians"
-    monthly_gp_df = await Functions.GP_dataframe(IOguild)
-    await Functions.GP_roles(bot, monthly_gp_df)
-    await LedukasSpam_channel.send("GP roles fixed!")
-    await Functions.red_gp(LedukasSpam_channel, monthly_gp_df, IOguild)
-
-    IOguild = "Pretherians"
-    monthly_gp_df = await Functions.GP_dataframe(IOguild)
-    await Functions.red_gp(LedukasSpam_channel, monthly_gp_df, IOguild)
+    for guild_name in logic.GUILD_NAMES:
+        monthly_gp_df = await Functions.GP_dataframe(guild_name)
+        # Only one guild runs the GP rank ladder and the Monthly Top role.
+        if guild_name == logic.RANK_ROLE_GUILD:
+            await Functions.GP_roles(bot, monthly_gp_df)
+            await LedukasSpam_channel.send("GP roles fixed!")
+        await Functions.red_gp(LedukasSpam_channel, monthly_gp_df, guild_name)
     #await Functions.promotions(bot, LedukasSpam_channel)
 
     conn.commit()

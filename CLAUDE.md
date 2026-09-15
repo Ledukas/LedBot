@@ -43,9 +43,13 @@ State lives in `DatabaseLedBot.db` (SQLite; gitignored, not committed — it hol
 - **`scripts/backup_db.py`** — standalone (no Discord/bot dependency) database backup utility; see `DEPLOY.md`.
 - **`tests/`** — pytest suite covering `logic.py`, `Functions.get_date()`, and `scripts/backup_db.py`; `tests/conftest.py` has the shared fixtures. Run via `pytest` from the repo root (`pytest.ini` sets `pythonpath = .`).
 
-### Per-guild duplication pattern
+### Per-guild configuration
 
-Almost every piece of guild-related logic is duplicated per IdleOn guild ("Aetherians" and "Pretherians") rather than generalized, both in code (parallel `if IOguild == "Aetherians"` / `"Pretherians"` branches) and in SQLite table naming: each guild has its own `{GuildName}_members`, `{GuildName}_discord`, `{GuildName}_game`, `{GuildName}_GP`, and `{GuildName}_GP_gained` tables, built with Python f-strings (`table_name_members = IOguild+'_members'`, etc.) rather than a schema/ORM. When touching guild-related code, expect to mirror changes for both guild names, and check the sync/promotion/kick commands in `LedBotCode.py` and the role/GP functions in `Functions.py` accordingly. GP role thresholds (`role_1_knight` ... `role_7_true` / `GProles`) are also duplicated as module-level globals in both `LedBotCode.py` and `Functions.py`.
+Each IdleOn guild ("Aetherians" and "Pretherians") owns its own SQLite tables, named `{GuildName}_members`, `{GuildName}_discord`, `{GuildName}_game`, `{GuildName}_GP` and `{GuildName}_GP_gained`. There is no schema or ORM -- the names are built by string interpolation -- but every call site goes through `logic.table_name(guild, kind)`, which validates both halves. Use it rather than writing `IOguild + '_members'` inline: a table name cannot be a bound SQL parameter, so the guild name (which arrives from whatever a moderator typed) is interpolated directly into the query, and that validation is the only thing keeping arbitrary input out of it.
+
+The guild list and ids live in `logic.GUILD_NAMES` / `logic.GUILD_GIDS`, and GP rank thresholds in `logic.RANK_THRESHOLDS` (with `RANK_ROLE_NAMES` and `GP_THRESHOLDS` derived from it). Guild-related code loops over `logic.GUILD_NAMES` rather than branching on the literal strings. Two genuine asymmetries between the guilds are named constants so they read as domain facts: `logic.RANK_ROLE_GUILD` (only Aetherians has the GP rank ladder and Monthly Top role) and `logic.PROMOTION_GUILD` (promotions run Pretherians into Aetherians). The only remaining guild literals are the two `.env` email mappings in `LedBotCode.py` and `Functions.GP_export`, where the environment variable names are per-guild by nature.
+
+This was previously duplicated throughout -- parallel `if IOguild == "Aetherians"` branches, f-string table names at 16 sites, and GP thresholds defined separately in both `LedBotCode.py` and `Functions.py`. If you are adding guild-related logic, add it to the shared config rather than reintroducing a branch.
 
 ### Weekly GP cycle
 
