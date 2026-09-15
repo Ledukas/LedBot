@@ -56,7 +56,7 @@ GP tracking is snapshot-based, keyed by date-stamped columns (`GP{year}_{month}_
 4. `Functions.red_gp` reports members below a per-guild GP-gained threshold (400 for Aetherians, 140 for Pretherians) to the mod channel.
 5. `scripts/backup_db.run_backup()` takes a timestamped DB snapshot, confirmed back to the mod channel.
 
-This runs automatically via `gp_weekly_loop` (a `discord.ext.tasks.loop` ticking daily at 2 AM, gated to only act on Saturdays — deliberately `tasks.loop` rather than a hand-rolled `while True` + `asyncio.sleep` loop, since the latter used to get duplicated on every gateway reconnect and caused the weekly report to occasionally send twice) or manually via the `!GP_weekly` command (Moderator-only, near-duplicate body of the same steps).
+This runs automatically via `gp_weekly_loop` (a `discord.ext.tasks.loop` ticking daily at 2 AM, gated to only act on Saturdays — deliberately `tasks.loop` rather than a hand-rolled `while True` + `asyncio.sleep` loop, since the latter used to get duplicated on every gateway reconnect and caused the weekly report to occasionally send twice) or manually via the `!GP_weekly` command (Moderator-only). Both call the same `run_weekly_gp(ack_channel)`; `ack_channel` only decides where the "GP exported" acknowledgement goes, while the reports themselves always go to the mod channel.
 
 ### Hardcoded IDs
 

@@ -31,7 +31,10 @@ LedukasSpam_channelID = int(os.environ.get('SPAM_CHANNEL_ID'))
 email_a = os.environ.get('EMAIL_A')
 email_p = os.environ.get('EMAIL_P')
 
+# WAL lets the weekly job and a moderator command touch the database at the
+# same moment without hitting "database is locked".
 conn = sqlite3.connect('DatabaseLedBot.db')
+conn.execute("PRAGMA journal_mode=WAL")
 
 # GP roles:
 role_1_knight = 1000
@@ -321,35 +324,47 @@ async def assign(ctx, IOguild, user_param, game_name):
     conn.commit()
 
 
+IDENTITY_TOOLKIT_URL = (
+    "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword"
+    "?key=AIzaSyAU62kOE6xhSrFqoXQPv6_WHxYilmoUxDk"
+)
+
+
+async def guild_login(ctx, IOguild):
+    """Resolve a guild name to its in-game id plus a fresh Firebase id token.
+
+    Returns (gid, id_token), or (None, None) after replying with the reason.
+    Shared by invite and kick, which used to carry their own copy of this.
+    """
+    if IOguild not in guilds_data:
+        await ctx.send(f"'{IOguild}' is not one of our guilds. Use: {', '.join(guilds_data)}")
+        return None, None
+
+    login = {
+        "email": guilds_data[IOguild]["email"],
+        "password": os.environ.get('PASSWORD'),
+        "returnSecureToken": True,
+    }
+    response = requests.post(IDENTITY_TOOLKIT_URL, json=login)
+    id_token = response.json().get("idToken", "")
+    if not id_token:
+        # Previously this fell through and sent "Bearer " with no token, so a
+        # credentials problem surfaced as an unrelated failure further on.
+        await ctx.send(f"Could not log in to {IOguild} in-game -- check the bot's credentials.")
+        return None, None
+
+    return guilds_data[IOguild]["gid"], id_token
+
+
 #command to send an invite
 @bot.command(name='invite')
 @commands.has_role("Moderator")
 async def invite(ctx, IOguild, InviteName):
-    
-    # login
-    if IOguild is None:
-        await ctx.send(f"No role given")
+
+    gid, id_token = await guild_login(ctx, IOguild)
+    if gid is None:
         return
-    if IOguild == "Aetherians":
-        gid = "jSiitSSM7nO0HFuoVlsa"
-        email = email_a
-    elif IOguild == "Pretherians": 
-        gid = "yuFnrJvPfK8ZdfFXHojg"
-        email = email_p
-    else: 
-        await ctx.send("That's not our guild!")
-        return
-    password = os.environ.get('PASSWORD')
-    
-    login = {
-        "email": email,
-        "password": password,
-        "returnSecureToken": True
-    }
-    
-    response = requests.post("https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=AIzaSyAU62kOE6xhSrFqoXQPv6_WHxYilmoUxDk", json=login)
-    loginResponse = response.json()
-    
+
     # send invite
     guildData = {
         "data": {
@@ -358,7 +373,7 @@ async def invite(ctx, IOguild, InviteName):
         }
     }
     headers = {
-        "Authorization": "Bearer " + loginResponse.get("idToken", "")
+        "Authorization": "Bearer " + id_token
     }
     response = requests.post("https://us-central1-idlemmo.cloudfunctions.net/igs", json=guildData, headers=headers)
     
@@ -380,32 +395,11 @@ async def invite(ctx, IOguild, InviteName):
 async def kick(ctx, IOguild, KickID):
     
     guild = bot.get_guild(809954021028134943)
-    
-    # login
-    if IOguild is None:
-        await ctx.send(f"No role given")
+
+    gid, id_token = await guild_login(ctx, IOguild)
+    if gid is None:
         return
-    if IOguild == "Aetherians":
-        gid = "jSiitSSM7nO0HFuoVlsa"
-        email = email_a
-    elif IOguild == "Pretherians": 
-        gid = "yuFnrJvPfK8ZdfFXHojg"
-        email = email_p
-    else: 
-        await ctx.send("That's not our guild!")
-        return
-    
-    password = os.environ.get('PASSWORD')
-    
-    login = {
-        "email": email,
-        "password": password,
-        "returnSecureToken": True
-    }
-    
-    response = requests.post("https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=AIzaSyAU62kOE6xhSrFqoXQPv6_WHxYilmoUxDk", json=login)
-    loginResponse = response.json()
-    
+
     # kick
     table_name_members = IOguild+'_members'
     
@@ -423,7 +417,7 @@ async def kick(ctx, IOguild, KickID):
         }
     }
     headers = {
-        "Authorization": "Bearer " + loginResponse.get("idToken", "")
+        "Authorization": "Bearer " + id_token
     }
     response = requests.post("https://us-central1-idlemmo.cloudfunctions.net/gk", json=guildData, headers=headers)
     
@@ -554,66 +548,50 @@ async def baba_ping():
             await asyncio.sleep(40)
 
 #does weekly GP things
-async def GP_weekly_auto():
+async def run_weekly_gp(ack_channel):
+    """One weekly GP cycle: refresh in-game GP, roll this week's snapshot
+    columns, reassign rank roles, report low-GP members, and back up the DB.
 
+    ack_channel receives only the "GP exported" acknowledgement -- the invoking
+    channel for !GP_weekly, the mod channel for the scheduled run. The reports
+    themselves always go to the mod channel, so the weekly history stays in one
+    place no matter where the command was typed. This used to be two
+    near-identical copies that would have drifted apart the first time only one
+    of them was updated.
+    """
     print("Starting weekly GP process")
-    await members_guild(LedukasSpam_channel) 
-    print("test1")
+    await members_guild(ack_channel)
     await Functions.GP_databases()
-    print("test2")
-    
+
     IOguild = "Aetherians"
     monthly_gp_df = await Functions.GP_dataframe(IOguild)
     await Functions.GP_roles(bot, monthly_gp_df)
     await LedukasSpam_channel.send("GP roles fixed!")
     await Functions.red_gp(LedukasSpam_channel, monthly_gp_df, IOguild)
-    print("test3")
-    
+
     IOguild = "Pretherians"
     monthly_gp_df = await Functions.GP_dataframe(IOguild)
     await Functions.red_gp(LedukasSpam_channel, monthly_gp_df, IOguild)
     #await Functions.promotions(bot, LedukasSpam_channel)
-    print("test4")
-    
-    print("weekly GP calculated automatically")
-    conn.commit()
 
-    # Data only changes on this weekly cycle, so back it up right after — no need
-    # for a separate always-on schedule (e.g. daily) that would just copy the same
-    # unchanged data most days.
+    conn.commit()
+    print("weekly GP calculated")
+
+    # Data only changes on this weekly cycle, so back it up right after. A
+    # separate always-on schedule would just copy the same unchanged data most
+    # days.
     try:
         backup_path = run_backup()
         await LedukasSpam_channel.send(f"Weekly backup created: `{backup_path.name}`")
     except Exception as e:
         print(e)
         await LedukasSpam_channel.send(f"Weekly backup failed: {e}")
+
 
 @bot.command(name='GP_weekly')
 @commands.has_role("Moderator")
 async def GP_weekly_man(ctx):
-
-    await members_guild(ctx) 
-    await Functions.GP_databases()
-    
-    IOguild = "Aetherians"
-    monthly_gp_df = await Functions.GP_dataframe(IOguild)
-    await Functions.GP_roles(bot, monthly_gp_df)
-    await LedukasSpam_channel.send("GP roles fixed!")
-    await Functions.red_gp(LedukasSpam_channel, monthly_gp_df, IOguild)
-    
-    IOguild = "Pretherians"
-    monthly_gp_df = await Functions.GP_dataframe(IOguild)
-    await Functions.red_gp(LedukasSpam_channel, monthly_gp_df, IOguild)
-
-    conn.commit()
-
-    try:
-        backup_path = run_backup()
-        await LedukasSpam_channel.send(f"Weekly backup created: `{backup_path.name}`")
-    except Exception as e:
-        print(e)
-        await LedukasSpam_channel.send(f"Weekly backup failed: {e}")
-
+    await run_weekly_gp(ctx)
 
 
 ##---------------------------------------------  Functions
@@ -627,7 +605,7 @@ async def GP_weekly_man(ctx):
 async def gp_weekly_loop():
     if not logic.is_saturday(datetime.now()):
         return
-    await GP_weekly_auto()
+    await run_weekly_gp(LedukasSpam_channel)
 
 ##---------------------------------------------  Errors
 # error messages for all commands

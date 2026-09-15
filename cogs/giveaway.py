@@ -26,6 +26,7 @@ class Giveaway(commands.Cog):
                         gp_required: int = None):
         
         conn = sqlite3.connect('DatabaseLedBot.db')
+        conn.execute("PRAGMA journal_mode=WAL")
         c = conn.cursor()
         
         try:
@@ -94,6 +95,8 @@ class Giveaway(commands.Cog):
                 json.dump(winners, f)
 
             await ctx.send(f"🎉 Congratulations {winner.mention}, you are the winner of the giveaway! 🎉")
+        except logic.GiveawayArgumentError as e:
+            await ctx.send(str(e))
         except Exception as e:
             await ctx.send(f"An error occurred: {e}")
 
