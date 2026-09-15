@@ -13,6 +13,8 @@ from datetime import datetime, timedelta, time
 import inspect
 import asyncio
 import random
+import sys
+import traceback
 
 import Functions
 import logic
@@ -618,6 +620,20 @@ async def assign_error(ctx, error):
     await ctx.send(logic.assign_error_message(error))
 @bot.event
 async def on_command_error(ctx, error):
+    # Log first, and log regardless of who replies: an unexpected error here is
+    # a real bug, and until now nothing was written anywhere for it -- no
+    # Discord message and no console output -- which is why so many failures
+    # looked like the bot simply ignoring the command.
+    if logic.is_unexpected_command_error(error):
+        print(f"Unhandled error in command {ctx.command}:", file=sys.stderr)
+        traceback.print_exception(type(error), error, error.__traceback__)
+
+    # discord.py dispatches here *in addition to* a command's own @cmd.error
+    # handler, so replying for a command that has one would double-message the
+    # user (assign is the only one today).
+    if ctx.command is not None and ctx.command.has_error_handler():
+        return
+
     message = logic.command_error_message(error)
     if message is not None:
         await ctx.send(message)

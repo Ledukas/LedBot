@@ -8,10 +8,8 @@ to import: unlike those modules, importing logic.py has zero side effects.
 
 A few of these were extracted specifically because doing so surfaced real
 bugs in the original inline code -- see the docstring/comments on
-compute_gp_rank_role, filter_red_gp, and compute_remaining_to_rankup. Those
-are noted in TODO.md as fixed. command_error_message is the deliberate
-exception: it preserves a known, still-open gap (see its docstring) rather
-than silently fixing it here.
+compute_gp_rank_role, filter_red_gp, compute_remaining_to_rankup and
+command_error_message. Those are noted in TODO.md as fixed.
 """
 
 from datetime import datetime
@@ -215,27 +213,52 @@ def assign_error_message(error: Exception) -> str:
         return "Command error"
 
 
+# Ordered rather than a dict: MissingRequiredArgument is a subclass of
+# UserInputError, so the more specific entry has to be matched first. A None
+# message means "expected, but deliberately silent" -- a cooldown or a
+# mistyped command name shouldn't produce a reply at all. MissingAnyRole is
+# listed separately because it is NOT a subclass of MissingRole, so the
+# has_any_role commands (wb-now, wb-next, gemdrop) used to fall through to
+# the silent default when an unauthorized user tried them.
+EXPECTED_COMMAND_ERRORS: list[tuple[type, str | None]] = [
+    (commands.MissingRole, "You don't have the required permissions to use this command."),
+    (commands.MissingAnyRole, "You don't have the required permissions to use this command."),
+    (commands.MissingRequiredArgument, "Missing an argument!"),
+    (commands.BotMissingPermissions, "The bot doesn't have the required permissions to run this command."),
+    (commands.UserInputError, "There was an error in the input."),
+    (commands.CommandOnCooldown, None),
+    (commands.CommandNotFound, None),
+]
+
+UNEXPECTED_ERROR_MESSAGE = (
+    "Something went wrong running that command. Ask a dev to check the bot logs."
+)
+
+
 def command_error_message(error: Exception) -> str | None:
     """Message for the global on_command_error handler, or None to send nothing.
 
-    Deliberately preserves a known gap rather than fixing it here: there is
-    no catch-all branch, so any exception type not explicitly listed below
-    (not just CommandOnCooldown) returns None and the user sees no feedback
-    at all. See TODO.md ("Global error handler silently swallows unrecognized
-    exceptions") -- that's a separate, larger fix not yet chosen to be
-    tackled; this function is pinned by a test that documents this exact gap.
+    Anything not in EXPECTED_COMMAND_ERRORS is treated as a real bug rather
+    than a predictable user mistake and gets a generic message. Previously
+    every unlisted exception type returned None, so any command without its
+    own .error handler -- which is all of them except assign -- failed with
+    no Discord reply and no log line at all.
+
+    Pair with is_unexpected_command_error to decide whether to also log a
+    traceback; this function stays pure so it can be tested on its own.
     """
-    if isinstance(error, commands.MissingRole):
-        return "You don't have the required permissions to use this command."
-    elif isinstance(error, commands.MissingRequiredArgument):
-        return "Missing an argument!"
-    elif isinstance(error, commands.BotMissingPermissions):
-        return "The bot doesn't have the required permissions to run this command."
-    elif isinstance(error, commands.UserInputError):
-        return "There was an error in the input."
-    elif isinstance(error, commands.CommandOnCooldown):
-        return None
-    return None
+    for error_type, message in EXPECTED_COMMAND_ERRORS:
+        if isinstance(error, error_type):
+            return message
+    return UNEXPECTED_ERROR_MESSAGE
+
+
+def is_unexpected_command_error(error: Exception) -> bool:
+    """True when error is not one of the anticipated user-facing cases, i.e.
+    when it is worth writing a full traceback to the log."""
+    return not any(
+        isinstance(error, error_type) for error_type, _ in EXPECTED_COMMAND_ERRORS
+    )
 
 
 def is_saturday(dt: datetime) -> bool:
