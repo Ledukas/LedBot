@@ -20,6 +20,30 @@ from discord.ext import commands
 
 
 # ---------------------------------------------------------------------------
+# Shared constants
+# ---------------------------------------------------------------------------
+
+# The Aetherian rank ladder, ascending. This lived in both LedBotCode.py and
+# Functions.py, and the two copies fed different things: the flat threshold
+# list drives the "GP needed to rank up" figure in !mygains, while the
+# (threshold, role) pairs drive the roles actually assigned. A threshold
+# changed in only one file would have had the bot quoting one scale and
+# assigning on another, with nothing raising an error. Both are derived from
+# this single table now, so they cannot disagree.
+RANK_THRESHOLDS: list[tuple[int, str]] = [
+    (1000, 'Aetherian Knight'),
+    (2500, 'Aetherian Hero'),
+    (5000, 'Aetherian Demigod'),
+    (10000, 'Aetherian Deity'),
+    (25000, 'Aetherian Titan'),
+    (50000, 'Aetherian Primordial'),
+    (100000, 'True Aetherian'),
+]
+RANK_ROLE_NAMES = [name for _, name in RANK_THRESHOLDS]
+GP_THRESHOLDS = [threshold for threshold, _ in RANK_THRESHOLDS]
+
+
+# ---------------------------------------------------------------------------
 # Extracted from Functions.py
 # ---------------------------------------------------------------------------
 

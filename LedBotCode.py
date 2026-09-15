@@ -15,6 +15,7 @@ import asyncio
 import random
 import sys
 import traceback
+import functools
 
 import Functions
 import logic
@@ -36,15 +37,7 @@ email_p = os.environ.get('EMAIL_P')
 conn = sqlite3.connect('DatabaseLedBot.db')
 conn.execute("PRAGMA journal_mode=WAL")
 
-# GP roles:
-role_1_knight = 1000
-role_2_hero = 2500
-role_3_demigod = 5000
-role_4_deity = 10000
-role_5_titan = 25000
-role_6_primordial = 50000
-role_7_true = 100000
-GProles = [role_6_primordial, role_5_titan, role_4_deity, role_3_demigod, role_2_hero, role_1_knight, role_7_true]
+# GP rank thresholds live in logic.RANK_THRESHOLDS (single source of truth).
 
 df_members_game = None
 
@@ -324,6 +317,21 @@ async def assign(ctx, IOguild, user_param, game_name):
     conn.commit()
 
 
+async def post_json(url, json=None, headers=None):
+    """requests.post, run off the event loop.
+
+    requests is synchronous, so calling it straight from an async command
+    handler blocks the whole bot for the length of the round trip -- every
+    other command stalls behind it, which on the Pi's connection is very
+    noticeable. Functions.get_cell_value already offloads its blocking Google
+    call the same way.
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None, functools.partial(requests.post, url, json=json, headers=headers)
+    )
+
+
 IDENTITY_TOOLKIT_URL = (
     "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword"
     "?key=AIzaSyAU62kOE6xhSrFqoXQPv6_WHxYilmoUxDk"
@@ -345,7 +353,7 @@ async def guild_login(ctx, IOguild):
         "password": os.environ.get('PASSWORD'),
         "returnSecureToken": True,
     }
-    response = requests.post(IDENTITY_TOOLKIT_URL, json=login)
+    response = await post_json(IDENTITY_TOOLKIT_URL, json=login)
     id_token = response.json().get("idToken", "")
     if not id_token:
         # Previously this fell through and sent "Bearer " with no token, so a
@@ -375,7 +383,7 @@ async def invite(ctx, IOguild, InviteName):
     headers = {
         "Authorization": "Bearer " + id_token
     }
-    response = requests.post("https://us-central1-idlemmo.cloudfunctions.net/igs", json=guildData, headers=headers)
+    response = await post_json("https://us-central1-idlemmo.cloudfunctions.net/igs", json=guildData, headers=headers)
     
     print(response.status_code)
     print(response.content.decode())
@@ -419,7 +427,7 @@ async def kick(ctx, IOguild, KickID):
     headers = {
         "Authorization": "Bearer " + id_token
     }
-    response = requests.post("https://us-central1-idlemmo.cloudfunctions.net/gk", json=guildData, headers=headers)
+    response = await post_json("https://us-central1-idlemmo.cloudfunctions.net/gk", json=guildData, headers=headers)
     
     data = json.loads(response.content.decode())
     result_value = data["result"]
@@ -510,7 +518,7 @@ async def mygains2(IOguild, c, user_did):
     c.execute(query, (user_gid,))
     user_gp = c.fetchall()
 
-    remaining_points = logic.compute_remaining_to_rankup(int(user_gp[0][0]), GProles)
+    remaining_points = logic.compute_remaining_to_rankup(int(user_gp[0][0]), logic.GP_THRESHOLDS)
 
     # Send the header and data as a message
     message = f"```{table_block}"
