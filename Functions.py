@@ -33,25 +33,7 @@ password = os.environ.get('PASSWORD')
 
 GP_prefix = 'GP'
 separator = ' | '
-# GP roles:
-role_1_knight = 1000
-role_2_hero = 2500
-role_3_demigod = 5000
-role_4_deity = 10000
-role_5_titan = 25000
-role_6_primordial = 50000
-role_7_true = 100000
-GProles = [role_6_primordial, role_5_titan, role_4_deity, role_3_demigod, role_2_hero, role_1_knight, role_7_true]
-RANK_THRESHOLDS = [
-    (role_1_knight, 'Aetherian Knight'),
-    (role_2_hero, 'Aetherian Hero'),
-    (role_3_demigod, 'Aetherian Demigod'),
-    (role_4_deity, 'Aetherian Deity'),
-    (role_5_titan, 'Aetherian Titan'),
-    (role_6_primordial, 'Aetherian Primordial'),
-    (role_7_true, 'True Aetherian'),
-]
-RANK_ROLE_NAMES = [name for _, name in RANK_THRESHOLDS]
+# GP rank thresholds live in logic.RANK_THRESHOLDS (single source of truth).
 
 
 WB_sheet_name = os.environ.get('WB_SHEET_NAME')
@@ -153,7 +135,7 @@ async def GP_roles(bot, monthly_gp_df):
         if member is None:
             continue
 
-        target_role_name = logic.compute_gp_rank_role(GP, RANK_THRESHOLDS)
+        target_role_name = logic.compute_gp_rank_role(GP, logic.RANK_THRESHOLDS)
         if target_role_name is None:
             continue
 
@@ -166,9 +148,9 @@ async def GP_roles(bot, monthly_gp_df):
             # Only remove the immediately-adjacent lower rank (promotion-only sync,
             # matching the original behavior -- this doesn't demote members whose
             # GP has dropped, and doesn't strip every other rank role they hold).
-            target_index = RANK_ROLE_NAMES.index(target_role_name)
+            target_index = logic.RANK_ROLE_NAMES.index(target_role_name)
             if target_index > 0:
-                lower_rank_name = RANK_ROLE_NAMES[target_index - 1]
+                lower_rank_name = logic.RANK_ROLE_NAMES[target_index - 1]
                 role2remove = discord.utils.get(guild.roles, name=lower_rank_name)
                 if role2remove is None:
                     print(f"Role '{lower_rank_name}' does not exist, leaving it in place")

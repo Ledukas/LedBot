@@ -190,3 +190,32 @@ class TestBuildGameMembersRows:
 
     def test_empty_dict(self):
         assert logic.build_game_members_rows({}) == []
+
+
+class TestRankThresholdConstants:
+    """RANK_THRESHOLDS used to be duplicated across LedBotCode.py and
+    Functions.py, feeding the !mygains rank-up figure and the actual role
+    assignment separately. These pin that everything is derived from one table
+    and stays in the order compute_gp_rank_role relies on."""
+
+    def test_thresholds_are_strictly_ascending(self):
+        values = [threshold for threshold, _ in logic.RANK_THRESHOLDS]
+        assert values == sorted(values)
+        assert len(set(values)) == len(values)
+
+    def test_derived_lists_match_the_table(self):
+        assert logic.GP_THRESHOLDS == [t for t, _ in logic.RANK_THRESHOLDS]
+        assert logic.RANK_ROLE_NAMES == [n for _, n in logic.RANK_THRESHOLDS]
+        assert len(logic.GP_THRESHOLDS) == len(logic.RANK_ROLE_NAMES)
+
+    def test_every_threshold_exactly_grants_its_own_rank(self):
+        """The bug that started all this: a strict '>' meant GP exactly equal
+        to a threshold matched no branch and granted no role."""
+        for threshold, role_name in logic.RANK_THRESHOLDS:
+            assert logic.compute_gp_rank_role(threshold, logic.RANK_THRESHOLDS) == role_name
+
+    def test_rankup_figure_agrees_with_the_rank_table(self):
+        """The two consumers must not disagree: just below a threshold, the
+        gap reported is exactly the distance to the rank that threshold grants."""
+        for threshold, _ in logic.RANK_THRESHOLDS[:-1]:
+            assert logic.compute_remaining_to_rankup(threshold - 1, logic.GP_THRESHOLDS) == 1
