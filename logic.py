@@ -173,6 +173,180 @@ def filter_red_gp(df: pd.DataFrame, io_guild: str, blacklist: list[str]) -> pd.D
     return filtered
 
 
+# ---------------------------------------------------------------------------
+# GP audit -- the mirror of red_gp: who is gaining implausibly much, rather
+# than too little.
+# ---------------------------------------------------------------------------
+
+# Where the weekly tasks top out. It is the most common non-zero gain in the
+# database by a factor of two over its neighbours (2311 weeks against 470 at
+# 690), because every member who simply finishes the week lands exactly on it.
+GP_TASK_CAP = 680
+
+# The bar a single week must clear to count against a member. Deliberately
+# above GP_TASK_CAP rather than on it: ordinary week-to-week variation carries
+# people past the cap, so counting from the cap itself reports every diligent
+# player in both guilds. Sustained gains above this need gold stopwatches, and
+# those run out with the trophies that buy them -- which is the thing actually
+# worth a second look.
+GP_GAIN_BAR = 750
+
+# A single week large enough to report on its own, checked strictly. 1200 is a
+# common exact value (71 weeks across 28 members, against 3-13 at each
+# neighbouring value), so landing on it is not the unusual part -- going past
+# it is. Repeatedly landing on it is caught by the sustained count instead,
+# since every such week also clears GP_GAIN_BAR.
+GP_SPIKE_WEEK = 1200
+
+# No player produces a week this size; it is the export mangling a row. The
+# real record is 2410.
+GP_IMPLAUSIBLE_WEEK = 5000
+
+GP_AUDIT_WEEKS = 8
+GP_AUDIT_HITS = 3
+GP_AUDIT_MIN_HISTORY = 8
+
+
+def parse_gp_value(value) -> int | None:
+    """One stored weekly gain as an int, or None if it is missing or junk.
+
+    The GP columns are added as TEXT (GP_databases has no schema to declare
+    otherwise), so every read comes back as a string.
+    """
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def observed_weeks(series: list[int | None]) -> list[int]:
+    """Usable weekly gains from a member's full history, oldest first.
+
+    Drops the first recorded week: Functions.GP_databases computes a gain
+    against a missing previous snapshot as `GPnow - 0`, so a member's first
+    week is their entire lifetime GP rather than a week's worth. Also drops
+    anything above GP_IMPLAUSIBLE_WEEK, which covers the same artifact landing
+    mid-history -- Pretherians has a duplicated row carrying one player's early
+    history spliced onto another's join week, putting a 20300 in the middle of
+    an otherwise ordinary series.
+    """
+    recorded = [value for value in series if value is not None]
+    return [value for value in recorded[1:] if value <= GP_IMPLAUSIBLE_WEEK]
+
+
+def latest_week(series: list[int | None]) -> int | None:
+    """Gain in the newest snapshot, or None if there is no usable figure.
+
+    Read off the newest column rather than off the member's last recorded
+    week, so a member missing from the latest export is not reported on a
+    figure that is several weeks old.
+    """
+    if not series:
+        return None
+    value = series[-1]
+    if value is None or value > GP_IMPLAUSIBLE_WEEK:
+        return None
+    if all(earlier is None for earlier in series[:-1]):
+        return None
+    return value
+
+
+def audit_member(series: list[int | None], weeks: int = GP_AUDIT_WEEKS) -> dict:
+    """Both audit signals for one member's history."""
+    history = observed_weeks(series)
+    window = history[-weeks:]
+    return {
+        "history": len(history),
+        "hits": sum(1 for value in window if value > GP_GAIN_BAR),
+        "window": window,
+        "latest": latest_week(series),
+    }
+
+
+def filter_gp_audit(
+    members: dict[str, list[int | None]],
+    weeks: int = GP_AUDIT_WEEKS,
+    hits: int = GP_AUDIT_HITS,
+    min_history: int = GP_AUDIT_MIN_HISTORY,
+) -> tuple[list[tuple[int, str, list[int]]], list[tuple[int, str]]]:
+    """Split members into (sustained, spiked), each sorted worst-first.
+
+    The two signals catch different profiles and neither subsumes the other.
+    Sustained wants a member above GP_GAIN_BAR in `hits` of the last `weeks`,
+    counted across the window rather than consecutively -- gains collapse
+    during in-game events, so a streak requirement lets anyone through on the
+    back of one quiet week. Spiked wants a single newest week past
+    GP_SPIKE_WEEK, because a lone enormous week between two ordinary ones never
+    accumulates enough hits: the member whose record 2410 week prompted this
+    sat at 2 of 6 under the sustained rule alone.
+
+    min_history gates only the sustained side. It exists to keep a member with
+    two weeks of history off a window-based count; a member three weeks into
+    the guild posting an enormous week is exactly what the spike check is for.
+    """
+    audited = {name: audit_member(series, weeks) for name, series in members.items()}
+
+    sustained = sorted(
+        (
+            (result["hits"], name, result["window"])
+            for name, result in audited.items()
+            if result["history"] >= min_history and result["hits"] >= hits
+        ),
+        key=lambda row: (-row[0], row[1]),
+    )
+    spiked = sorted(
+        (
+            (result["latest"], name)
+            for name, result in audited.items()
+            if result["latest"] is not None and result["latest"] > GP_SPIKE_WEEK
+        ),
+        key=lambda row: (-row[0], row[1]),
+    )
+    return sustained, spiked
+
+
+def format_gp_audit(
+    io_guild: str,
+    sustained: list[tuple[int, str, list[int]]],
+    spiked: list[tuple[int, str]],
+    weeks: int = GP_AUDIT_WEEKS,
+    hits: int = GP_AUDIT_HITS,
+) -> str:
+    """Render one guild's audit as a Discord message.
+
+    Always names the figures that produced a flag. This report exists to start
+    an investigation, not to conclude one, and a moderator cannot judge a name
+    without the weeks behind it.
+
+    A flagged member takes two lines, their weeks indented underneath, rather
+    than one padded row. Names here can carry a '(was ...)' rename suffix, and
+    the single-row version either truncated those mid-name or pushed the line
+    wide enough to wrap in a phone's code block.
+    """
+    lines = [f"**{io_guild} -- GP audit**"]
+
+    if sustained:
+        lines.append(f"Above {GP_GAIN_BAR} in {hits}+ of the last {weeks} weeks:")
+        block = "\n".join(
+            f"{name}  --  {count} of {weeks}\n    "
+            + ", ".join(str(value) for value in window)
+            for count, name, window in sustained
+        )
+        lines.append(f"```\n{block}\n```")
+    else:
+        lines.append(f"Nobody above {GP_GAIN_BAR} in {hits}+ of the last {weeks} weeks.")
+
+    if spiked:
+        lines.append(f"Above {GP_SPIKE_WEEK} this week:")
+        width = max(len(name) for _, name in spiked)
+        block = "\n".join(
+            f"{name:<{width}}  {value:,}" for value, name in spiked
+        )
+        lines.append(f"```\n{block}\n```")
+
+    return "\n".join(lines)
+
+
 def format_table_block(
     df: pd.DataFrame,
     first_col_width: int = 14,

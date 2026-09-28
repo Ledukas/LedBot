@@ -553,6 +553,23 @@ async def mygains2(IOguild, c, user_did):
 async def promotions(ctx):
     await Functions.promotions(bot, LedukasSpam_channel)
 
+@bot.command(name='gp_audit')
+@commands.has_role("Moderator")
+async def gp_audit(ctx, IOguild: str = None):
+    """Members whose weekly GP gains are worth a closer look.
+
+    Runs automatically as part of the weekly cycle; this is for checking
+    between Saturdays, or re-reading last week's report without re-running it.
+    Replies in the invoking channel rather than the mod channel, since a
+    moderator asking for it on demand wants to see the answer where they asked.
+    """
+    if IOguild is not None and IOguild not in logic.GUILD_NAMES:
+        await ctx.send(f"Unknown guild '{IOguild}'. Pick one of: {', '.join(logic.GUILD_NAMES)}")
+        return
+
+    for guild_name in ([IOguild] if IOguild else logic.GUILD_NAMES):
+        await Functions.gp_audit(ctx, guild_name)
+
 #baba pings
 async def baba_ping():
     while True:
@@ -608,6 +625,7 @@ async def run_weekly_gp(ack_channel):
                 else:
                     await LedukasSpam_channel.send(f"GP roles not fully synced: {roles_status}")
             await Functions.red_gp(LedukasSpam_channel, monthly_gp_df, guild_name)
+            await Functions.gp_audit(LedukasSpam_channel, guild_name)
         #await Functions.promotions(bot, LedukasSpam_channel)
     finally:
         # In a finally because GP_databases above has already written this

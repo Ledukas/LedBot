@@ -287,6 +287,68 @@ async def red_gp(channel, monthly_gp_df, IOguild):
     await channel.send(file=file)
     os.remove('red.txt')
 
+GP_COLUMN_RE = re.compile(r'^GP(\d{4})_(\d{2})_(\d{2})$')
+
+
+def _gp_snapshot_columns(table_name_gained):
+    """Every weekly snapshot column of the table, oldest first."""
+    names = [row[1] for row in c.execute(f"PRAGMA table_info({table_name_gained})")]
+    dated = [
+        (match.groups(), name)
+        for match, name in ((GP_COLUMN_RE.match(n), n) for n in names)
+        if match
+    ]
+    return [name for _, name in sorted(dated)]
+
+
+def _load_gp_series(IOguild):
+    """Full weekly-gain history per current in-game member, oldest week first.
+
+    Joined and labelled on {guild}_game rather than on the GP table. Joining by
+    G_ID is what survives a character rename, and the GP tables keep whatever
+    name the member had when GP_databases first inserted their row, so those
+    names go stale -- reporting one would send a moderator looking for somebody
+    who, under that name, is not in the guild list at all.
+
+    The whole history is read, not just the audited window: logic.audit_member
+    has to know which week is a member's first (that one is their lifetime GP,
+    not a week's worth) and how many weeks they have in total.
+    """
+    table_name_gained = logic.table_name(IOguild, 'GP_gained')
+    table_name_game = logic.table_name(IOguild, 'game')
+    columns = _gp_snapshot_columns(table_name_gained)
+
+    rows = c.execute(
+        f"SELECT r.G_NAME, g.Name, {', '.join('g.' + column for column in columns)} "
+        f"FROM {table_name_gained} AS g "
+        f"JOIN {table_name_game} AS r ON r.G_ID = g.G_ID"
+    ).fetchall()
+
+    members = {}
+    for current_name, gp_name, *gains in rows:
+        label = current_name if current_name == gp_name else f"{current_name} (was {gp_name})"
+        members[label] = [logic.parse_gp_value(value) for value in gains]
+    return members
+
+
+async def gp_audit(channel, IOguild):
+    """Report members whose weekly GP gains are worth a closer look.
+
+    The mirror of red_gp. Sent as a message rather than a .txt attachment
+    because it names a handful of members at most, and one a moderator is
+    meant to act on should be readable without opening a file.
+    """
+    try:
+        members = _load_gp_series(IOguild)
+    except Exception as e:
+        print("line: " + str(inspect.currentframe().f_lineno) + "\n error: " + str(e))
+        await channel.send(f"Error building GP audit for {IOguild}: {e}")
+        return
+
+    sustained, spiked = logic.filter_gp_audit(members)
+    await channel.send(logic.format_gp_audit(IOguild, sustained, spiked))
+
+
 async def promotions(bot, channel):
     try:
         with open('promo.txt', 'w') as file:
