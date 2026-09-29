@@ -16,6 +16,7 @@ from google.oauth2.service_account import Credentials
 import asyncio
 
 import logic
+from scripts.backup_db import run_backup
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 CREDS = Credentials.from_service_account_file(
@@ -347,6 +348,429 @@ async def gp_audit(channel, IOguild):
 
     sustained, spiked = logic.filter_gp_audit(members)
     await channel.send(logic.format_gp_audit(IOguild, sustained, spiked))
+
+
+def _load_link_snapshot(IOguild):
+    """Everything the link commands reason about, in three full scans.
+
+    All three tables are a few hundred to a thousand rows and carry no useful
+    indexes, so scanning them costs nothing and saves every caller from
+    re-deriving the same joins. Ids are normalized here, at the boundary, so
+    nothing downstream ever compares two different storage classes.
+
+    No WHERE clause on _members on purpose: deciding which rows matter is
+    logic.find_link_conflicts' job, where it is covered by tests.
+    """
+    table_members = logic.table_name(IOguild, 'members')
+    table_game = logic.table_name(IOguild, 'game')
+    table_discord = logic.table_name(IOguild, 'discord')
+
+    links = [
+        {
+            'rowid': row[0],
+            'discord': row[1],
+            'd_id': logic.normalize_discord_id(row[2]),
+            'display': row[3],
+            'g_id': logic.normalize_game_id(row[4]),
+            'g_name': row[5],
+        }
+        for row in c.execute(
+            f"SELECT rowid, Discord, D_ID, Display, G_ID, G_NAME FROM {table_members}"
+        ).fetchall()
+    ]
+
+    live_characters = {}
+    for g_name, g_id, gp in c.execute(f"SELECT G_NAME, G_ID, GP FROM {table_game}").fetchall():
+        key = logic.normalize_game_id(g_id)
+        if key is not None:
+            live_characters[key] = (g_name, logic.parse_gp_value(gp))
+
+    live_accounts = {}
+    for d_id, discord_name, display in c.execute(
+        f"SELECT D_ID, Discord, Display FROM {table_discord}"
+    ).fetchall():
+        key = logic.normalize_discord_id(d_id)
+        if key is not None:
+            live_accounts[key] = display or discord_name
+
+    return links, live_characters, live_accounts
+
+
+async def conflicts(channel, IOguild, announce_clean=False):
+    """Report link rows needing attention; silent by default when there are none.
+
+    announce_clean defaults to False so that an automated caller added to the
+    weekly cycle later cannot start posting "nothing to report" every Saturday
+    just by forgetting the argument. The manual command opts in.
+
+    Load failures are always reported, even on the silent path -- otherwise a
+    crash and a clean week look identical in the mod channel.
+    """
+    try:
+        links, live_characters, _ = _load_link_snapshot(IOguild)
+        character_conflicts, account_conflicts = logic.find_link_conflicts(links, live_characters)
+    except Exception as e:
+        print("line: " + str(inspect.currentframe().f_lineno) + "\n error: " + str(e))
+        await channel.send(f"Error building the link-conflict report for {IOguild}: {e}")
+        return
+
+    message = logic.format_conflicts(IOguild, character_conflicts, account_conflicts)
+    if message is None:
+        if announce_clean:
+            await channel.send(f"{IOguild}: no link conflicts found.")
+        return
+    await channel.send(message)
+
+
+def _recent_gains(IOguild, g_ids):
+    """The last few weekly gains for each of `g_ids`."""
+    if not g_ids:
+        return {}
+    table_gained = logic.table_name(IOguild, 'GP_gained')
+    columns = _gp_snapshot_columns(table_gained)[-logic.WHOIS_GAIN_WEEKS:]
+    if not columns:
+        return {}
+    placeholders = ', '.join('?' for _ in g_ids)
+    rows = c.execute(
+        f"SELECT G_ID, {', '.join(columns)} FROM {table_gained} "
+        f"WHERE G_ID IN ({placeholders})",
+        tuple(g_ids),
+    ).fetchall()
+    return {
+        logic.normalize_game_id(row[0]): [
+            value for value in (logic.parse_gp_value(v) for v in row[1:]) if value is not None
+        ]
+        for row in rows
+    }
+
+
+def _search_links(IOguild, term):
+    """Rows of the three tables matching `term` in any column.
+
+    Every column is searched rather than guessing what kind of thing the term
+    is. Game ids come in two formats and names can look like anything, so
+    detection would be guesswork; searching everything cannot mis-detect.
+
+    _game.G_NAME is searched as well as _members.G_NAME because the latter is
+    frozen at !assign time -- 60 of the ~406 live link rows carry a name the
+    character no longer uses, so searching only _members would fail to find
+    somebody by the name they go by now.
+    """
+    table_members = logic.table_name(IOguild, 'members')
+    table_game = logic.table_name(IOguild, 'game')
+    table_discord = logic.table_name(IOguild, 'discord')
+
+    pattern = logic.like_term(term)
+    partial = logic.is_searchable_term(term)
+
+    def where(partial_columns, exact_columns):
+        """One WHERE clause and its parameters, built together.
+
+        Deriving the placeholder count and the parameter list in the same loop
+        is what keeps them from drifting: a term too short to search on drops
+        the partial columns from both at once, rather than from the SQL in one
+        place and the bindings in another.
+        """
+        clauses, params = [], []
+        if partial:
+            for column in partial_columns:
+                clauses.append(f"({column} LIKE ? ESCAPE '\\')")
+                params.append(pattern)
+        for column in exact_columns:
+            clauses.append(f"{column} = ?")
+            params.append(term)
+        if not clauses:
+            return "0", ()
+        return " OR ".join(clauses), tuple(params)
+
+    clause, params = where(['G_NAME', 'Display', 'Discord'], ['G_ID', 'CAST(D_ID AS TEXT)'])
+    member_rows = c.execute(
+        f"SELECT G_ID, D_ID FROM {table_members} WHERE {clause}", params
+    ).fetchall()
+
+    clause, params = where(['G_NAME'], ['G_ID'])
+    game_rows = c.execute(
+        f"SELECT G_ID FROM {table_game} WHERE {clause}", params
+    ).fetchall()
+
+    clause, params = where(['Display', 'Discord'], ['CAST(D_ID AS TEXT)'])
+    discord_rows = c.execute(
+        f"SELECT D_ID FROM {table_discord} WHERE {clause}", params
+    ).fetchall()
+
+    g_ids = {logic.normalize_game_id(row[0]) for row in member_rows}
+    g_ids |= {logic.normalize_game_id(row[0]) for row in game_rows}
+    d_ids = {logic.normalize_discord_id(row[1]) for row in member_rows}
+    d_ids |= {logic.normalize_discord_id(row[0]) for row in discord_rows}
+    # Dropping None here is what keeps the five blank rows out of the IN lists
+    # below; left in, they match each other and every answer grows a phantom.
+    return g_ids - {None}, d_ids - {None}
+
+
+async def whois(channel, term, discord_guild=None):
+    """Look a member up by any of game name, game id, Discord name or id."""
+    term = term.strip()
+    if not term:
+        await channel.send("Give something to search for: a game name, game id, Discord name or id.")
+        return
+
+    try:
+        messages = []
+        found_any = False
+        for IOguild in logic.GUILD_NAMES:
+            seed_g_ids, seed_d_ids = _search_links(IOguild, term)
+            if not seed_g_ids and not seed_d_ids:
+                continue
+
+            links, live_characters, live_accounts = _load_link_snapshot(IOguild)
+            matched = [
+                row for row in links
+                if row['g_id'] in seed_g_ids or row['d_id'] in seed_d_ids
+            ]
+            # Expand: every row touching a matched character or account, so the
+            # cross-check a moderator is really asking for happens without them
+            # having to run a second search.
+            expanded_g = {row['g_id'] for row in matched} | seed_g_ids
+            expanded_d = {row['d_id'] for row in matched} | seed_d_ids
+            expanded = [
+                row for row in links
+                if row['g_id'] in expanded_g or row['d_id'] in expanded_d
+            ]
+
+            characters = {row['g_id'] for row in expanded if row['g_id']} | (
+                seed_g_ids & live_characters.keys()
+            )
+            if len(characters) > logic.WHOIS_MAX_CHARACTERS:
+                names = [
+                    logic.character_name(live_characters.get(g_id)) or g_id
+                    for g_id in characters
+                ]
+                messages.append(logic.format_whois_too_many(term, names))
+                found_any = True
+                continue
+
+            role_holders = _resolve_role_holders(discord_guild, IOguild, expanded_d)
+            gains = _recent_gains(IOguild, sorted(characters))
+
+            records = logic.whois_characters(
+                expanded, live_characters, live_accounts, role_holders, gains
+            )
+            unlinked_characters, unlinked_accounts = logic.whois_unlinked(
+                {g_id: live_characters[g_id] for g_id in seed_g_ids if g_id in live_characters},
+                {d_id: live_accounts[d_id] for d_id in seed_d_ids if d_id in live_accounts},
+                {row['g_id'] for row in expanded},
+                {row['d_id'] for row in expanded},
+            )
+            message = logic.format_whois(
+                IOguild, records, unlinked_characters, unlinked_accounts
+            )
+            if message:
+                messages.append(message)
+                found_any = True
+    except Exception as e:
+        print("line: " + str(inspect.currentframe().f_lineno) + "\n error: " + str(e))
+        await channel.send(f"Error looking up '{term}': {e}")
+        return
+
+    if not found_any:
+        if not logic.is_searchable_term(term):
+            # Say why rather than reporting an honest-looking "nothing found":
+            # a short term only ever ran as an exact id match, so "no match" and
+            # "not searched" look identical from the outside.
+            await channel.send(
+                f"'{term}' is too short to search on -- give at least "
+                f"{logic.SEARCH_MIN_PARTIAL} characters, or an exact id."
+            )
+            return
+        await channel.send(f"Nothing matches '{term}' in either guild.")
+        return
+    for message in messages:
+        await channel.send(message)
+
+
+def _resolve_role_holders(discord_guild, IOguild, d_ids):
+    """Who still holds the guild role, asked of Discord rather than the database.
+
+    {guild}_discord is rebuilt only by !members_discord and !sync_counters,
+    both manual, so it can be weeks stale -- reading it would answer this
+    question from a snapshot nobody has refreshed. GP_roles and the giveaway
+    cog already resolve membership this way.
+
+    A Discord id missing from the member cache is left out entirely rather than
+    reported as absent, so the report can say "unknown" instead of guessing.
+    """
+    if discord_guild is None:
+        return {}
+    holders = {}
+    for d_id in d_ids:
+        if d_id is None:
+            continue
+        member = discord_guild.get_member(int(d_id))
+        if member is None:
+            continue
+        holders[d_id] = any(role.name == IOguild for role in member.roles)
+    return holders
+
+
+def _relink_write(IOguild, g_id, current_name, target):
+    """Repoint one character's link rows. Synchronous, and must stay that way.
+
+    Functions.conn is a single connection shared by every coroutine, and
+    GP_export, GP_databases and mark_weekly_run_started all commit on it. An
+    await anywhere between the SELECT and the commit would let one of them
+    commit this function's half-finished delete, so the whole transaction runs
+    without yielding and the message is built by the caller afterwards.
+
+    The delete names the rowids read a few lines above rather than repeating
+    `WHERE G_ID = ?`. The predicate would be re-evaluated at delete time, so a
+    row inserted in between would be removed without ever appearing in the
+    report -- and that report is the only readable record of what went.
+    """
+    table_members = logic.table_name(IOguild, 'members')
+
+    began = False
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        began = True
+    except sqlite3.OperationalError as e:
+        # Only a transaction already open on the shared connection is tolerable
+        # -- the work below still commits as one unit. "database is locked"
+        # raises the same class and must not be swallowed: continuing would run
+        # the SELECT without the write lock that stops a concurrent !assign
+        # slipping a row in between it and the DELETE.
+        if "within a transaction" not in str(e):
+            raise
+
+    try:
+        rows = [
+            {
+                'rowid': row[0],
+                'discord': row[1],
+                'd_id': logic.normalize_discord_id(row[2]),
+                'display': row[3],
+                'g_name': row[5],
+            }
+            for row in c.execute(
+                f"SELECT rowid, Discord, D_ID, Display, G_ID, G_NAME "
+                f"FROM {table_members} WHERE G_ID = ? ORDER BY rowid",
+                (g_id,),
+            ).fetchall()
+        ]
+
+        delete_rowids, keep_rowid, need_insert = logic.plan_relink(rows, target['d_id'])
+        removed = [row for row in rows if row['rowid'] in set(delete_rowids)]
+        kept = next((row for row in rows if row['rowid'] == keep_rowid), None)
+
+        if delete_rowids:
+            placeholders = ', '.join('?' for _ in delete_rowids)
+            c.execute(
+                f"DELETE FROM {table_members} WHERE rowid IN ({placeholders})",
+                tuple(delete_rowids),
+            )
+
+        inserted = None
+        if need_insert:
+            # The current in-game name, never whatever the moderator typed --
+            # relinking by a former name would otherwise write that name back.
+            c.execute(
+                f"INSERT INTO {table_members} (Discord, D_ID, Display, G_ID, G_NAME) "
+                f"VALUES (?,?,?,?,?)",
+                (target['discord'], int(target['d_id']), target['display'], g_id, current_name),
+            )
+            inserted = target
+
+        conn.commit()
+    except Exception:
+        # Only roll back a transaction this function opened. If one was already
+        # in flight, rolling back would discard whatever the other coroutine had
+        # pending as well.
+        if began:
+            conn.rollback()
+        raise
+
+    return removed, kept, inserted
+
+
+def load_relink_candidates():
+    """What resolve_relink_target needs, across both guilds.
+
+    Lives here rather than in the command because assembling it is three table
+    reads per guild, and the command layer does no SQL-shaped work anywhere
+    else in this bot.
+
+    Returns live characters keyed (guild, g_id), and an index of lowercased
+    former names to the (guild, g_id) pairs that once used them -- a character
+    renamed since !assign is otherwise unfindable by the name a moderator
+    remembers.
+    """
+    live_characters = {}
+    historical_names = {}
+    for IOguild in logic.GUILD_NAMES:
+        links, live, _ = _load_link_snapshot(IOguild)
+        for g_id, entry in live.items():
+            live_characters[(IOguild, g_id)] = entry
+        for row in links:
+            if row['g_id'] and row['g_name']:
+                historical_names.setdefault(row['g_name'].lower(), []).append(
+                    (IOguild, row['g_id'])
+                )
+    return live_characters, historical_names
+
+
+async def relink(channel, IOguild, g_id, target):
+    """Point a currently in-game character at the right Discord account.
+
+    This is the only place in the bot that deletes anything. A superseded link
+    row is genuinely lost -- it has to be, because GP_roles reads every row for
+    a live character and would otherwise keep handing the rank role to the old
+    account. The backup taken first makes that recoverable and the echoed rows
+    make it legible; between them, nothing disappears silently.
+
+    GP history is untouched either way: _GP and _GP_gained are keyed on G_ID
+    and fed from {guild}_game, and nothing reads them through _members.
+    """
+    try:
+        links, live_characters, _ = _load_link_snapshot(IOguild)
+        if g_id not in live_characters:
+            await channel.send(
+                f"{g_id} is not currently in {IOguild} in game. "
+                f"Run !members_game first if they only just joined."
+            )
+            return
+        current_name = logic.character_name(live_characters[g_id])
+    except Exception as e:
+        print("line: " + str(inspect.currentframe().f_lineno) + "\n error: " + str(e))
+        await channel.send(f"Error reading {IOguild} before relinking: {e}")
+        return
+
+    try:
+        backup_name = run_backup().name
+    except Exception as e:
+        print("line: " + str(inspect.currentframe().f_lineno) + "\n error: " + str(e))
+        await channel.send(f"Refusing to relink: the safety backup failed ({e}).")
+        return
+
+    try:
+        removed, kept, inserted = _relink_write(IOguild, g_id, current_name, target)
+    except Exception as e:
+        print("line: " + str(inspect.currentframe().f_lineno) + "\n error: " + str(e))
+        await channel.send(f"Relink failed and was rolled back: {e}. Backup: `{backup_name}`")
+        return
+
+    # Read off the snapshot taken before the write rather than reloading: the
+    # only rows this relink touched are the ones for g_id, which are excluded
+    # here anyway, so a second scan of all three tables would answer the same.
+    others = sorted(
+        logic.character_name(live_characters.get(row['g_id'])) or row['g_id']
+        for row in links
+        if row['d_id'] == target['d_id'] and row['g_id'] != g_id and row['g_id'] in live_characters
+    )
+    warning = logic.relink_warning(IOguild, target['display'], others)
+
+    await channel.send(logic.format_relink_result(
+        IOguild, current_name, g_id, removed, kept, inserted,
+        backup_name=backup_name, warning=warning,
+    ))
 
 
 async def promotions(bot, channel):

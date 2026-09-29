@@ -309,6 +309,24 @@ async def assign(ctx, IOguild, user_param, game_name):
                 f"Check the spelling, or run !members_game first if they only just joined."
             )
             return
+        # The LEFT JOIN is what lets the refusal name the account's current
+        # display rather than the one frozen into _members at assign time,
+        # which is stale on most rows. CAST on both sides because affinity is
+        # not applied between two columns of different storage class.
+        table_name_discord = logic.table_name(IOguild, 'discord')
+        existing_links = c.execute(
+            f"SELECT m.D_ID, COALESCE(d.Display, m.Display) "
+            f"FROM {table_name_members} m "
+            f"LEFT JOIN {table_name_discord} d "
+            f"  ON CAST(d.D_ID AS TEXT) = CAST(m.D_ID AS TEXT) "
+            f"WHERE m.G_ID = ?",
+            (game[2],),
+        ).fetchall()
+        blocked = logic.assign_block_message(IOguild, game_name, existing_links, user.id)
+        if blocked:
+            await ctx.send(blocked)
+            return
+
         c.execute('INSERT INTO ' + table_name_members + ' (Discord, D_ID, Display, G_ID, G_NAME) VALUES (?,?,?,?,?)',
                     (user.name + '#' + user.discriminator, user.id, user.display_name, game[2], game[1]))
 
@@ -553,6 +571,84 @@ async def mygains2(IOguild, c, user_did):
 async def promotions(ctx):
     await Functions.promotions(bot, LedukasSpam_channel)
 
+@bot.command(name='whois')
+@commands.has_role("Moderator")
+async def whois(ctx, *, term: str = None):
+    """Look a member up by game name, game id, Discord name or Discord id.
+
+    One term, matched against every column rather than detected -- game ids
+    come in two formats and names can look like anything, so guessing which
+    kind of thing was typed would be guesswork that silently finds nothing.
+
+    Replies where it was asked rather than in the mod channel: this is a
+    lookup tool and the answer is wanted in the conversation that prompted it.
+    Note that means the account-to-character mapping lands in whatever channel
+    a moderator types it in.
+    """
+    if term is None:
+        await ctx.send("Usage: !whois <game name | game id | discord name | discord id>")
+        return
+    await Functions.whois(ctx, term, discord_guild=ctx.guild)
+
+@bot.command(name='conflicts')
+@commands.has_role("Moderator")
+async def conflicts(ctx, IOguild: str = None):
+    """Link rows that need attention. Also runs as part of the weekly cycle."""
+    if IOguild is not None and IOguild not in logic.GUILD_NAMES:
+        await ctx.send(f"Unknown guild '{IOguild}'. Pick one of: {', '.join(logic.GUILD_NAMES)}")
+        return
+
+    for guild_name in ([IOguild] if IOguild else logic.GUILD_NAMES):
+        await Functions.conflicts(ctx, guild_name, announce_clean=True)
+
+@bot.command(name='relink')
+@commands.has_role("Moderator")
+async def relink(ctx, character: str = None, *, member: str = None):
+    """Point an in-game character at the right Discord account.
+
+    The guild is worked out from whichever roster the character is on, so it
+    is not an argument; an ambiguous name is refused with the candidates
+    rather than resolved by guessing.
+    """
+    if character is None or member is None:
+        await ctx.send("Usage: !relink <game name | game id> <@member | discord id>")
+        return
+
+    try:
+        live_characters, historical_names = Functions.load_relink_candidates()
+    except Exception as e:
+        await ctx.send(f"Error reading the guild rosters: {e}")
+        return
+
+    resolved, refusal = logic.resolve_relink_target(character, live_characters, historical_names)
+    if resolved is None:
+        await ctx.send(refusal)
+        return
+    guild_name, g_id = resolved
+
+    # MemberConverter handles a mention, a raw id, a name or name#discriminator
+    # in one; the fetch_user fallback is what still resolves somebody who has
+    # left the server, which is exactly the case a relink is usually fixing.
+    user = None
+    try:
+        user = await commands.MemberConverter().convert(ctx, member)
+    except commands.BadArgument:
+        target_id = logic.normalize_discord_id(member)
+        if target_id is not None:
+            try:
+                user = await bot.fetch_user(int(target_id))
+            except discord.NotFound:
+                user = None
+    if user is None:
+        await ctx.send(f"Could not find a Discord user matching '{member}'.")
+        return
+
+    await Functions.relink(ctx, guild_name, g_id, {
+        'discord': user.name + '#' + user.discriminator,
+        'd_id': str(user.id),
+        'display': getattr(user, 'display_name', user.name),
+    })
+
 @bot.command(name='gp_audit')
 @commands.has_role("Moderator")
 async def gp_audit(ctx, IOguild: str = None):
@@ -626,6 +722,9 @@ async def run_weekly_gp(ack_channel):
                     await LedukasSpam_channel.send(f"GP roles not fully synced: {roles_status}")
             await Functions.red_gp(LedukasSpam_channel, monthly_gp_df, guild_name)
             await Functions.gp_audit(LedukasSpam_channel, guild_name)
+            # Silent unless there is something to report -- announce_clean
+            # stays at its default here on purpose.
+            await Functions.conflicts(LedukasSpam_channel, guild_name)
         #await Functions.promotions(bot, LedukasSpam_channel)
     finally:
         # In a finally because GP_databases above has already written this
