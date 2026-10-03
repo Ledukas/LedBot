@@ -140,7 +140,7 @@ class TestFilterGpAudit:
 class TestFormatGpAudit:
     def test_names_the_weeks_behind_each_flag(self):
         report = logic.format_gp_audit(
-            "Aetherians", [(3, "Someone", [900, 100, 900, 100, 900, 100, 50, 60])], []
+            [(3, "Someone", [900, 100, 900, 100, 900, 100, 50, 60])], []
         )
         assert "Someone" in report
         assert "900, 100, 900" in report
@@ -149,25 +149,25 @@ class TestFormatGpAudit:
         """Truncating here would send a moderator looking for a name that does
         not exist in either the guild list or the database."""
         report = logic.format_gp_audit(
-            "Aetherians", [(3, "Kawaby (was TheOnlyVoid)", [1020, 630, 1200])], []
+            [(3, "Kawaby (was TheOnlyVoid)", [1020, 630, 1200])], []
         )
         assert "Kawaby (was TheOnlyVoid)" in report
 
-    def test_quiet_guild_says_so_explicitly(self):
-        report = logic.format_gp_audit("Pretherians", [], [])
-        assert "Nobody above" in report
-        assert "```" not in report
+    def test_quiet_guild_is_none(self):
+        """The weekly report's silence depends on this; the manual command
+        turns it into a line."""
+        assert logic.format_gp_audit([], []) is None
 
     def test_spike_section_only_appears_when_there_is_one(self):
-        assert "this week" not in logic.format_gp_audit("Aetherians", [], [])
-        assert "this week" in logic.format_gp_audit("Aetherians", [], [(1500, "Someone")])
+        sustained = [(3, "Someone", [900, 900, 900])]
+        assert "this week" not in logic.format_gp_audit(sustained, [])
+        assert "this week" in logic.format_gp_audit([], [(1500, "Someone")])
 
-    def test_fits_in_a_discord_message(self):
-        """2000 characters is the hard limit on a single send."""
+    def test_fits_in_an_embed(self):
         sustained = [(8, f"member_number_{i}", [1500] * 8) for i in range(15)]
         spiked = [(1500, f"member_number_{i}") for i in range(15)]
-        report = logic.format_gp_audit("Aetherians", sustained, spiked)
-        assert len(report) < 2000
+        report = logic.format_gp_audit(sustained, spiked)
+        assert len(report) < logic.EMBED_DESCRIPTION_LIMIT
 
 
 class TestThresholdsHangTogether:

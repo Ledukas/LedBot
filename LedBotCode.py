@@ -175,12 +175,16 @@ async def members_discord(ctx):
 @bot.command(name='members_game')
 @commands.has_role("Moderator")
 async def members_guild(ctx):
+    await export_game_rosters()
+    await ctx.send("GP exported")
+
+
+async def export_game_rosters():
     # The same non-blocking roster read and cached login the invite poll uses.
     # This was pyrebase, which is synchronous and froze the whole bot --
     # the invite poll included -- for the length of the export.
     for guild_name in logic.GUILD_NAMES:
         Functions.write_game_roster(guild_name, await fetch_guild_roster(guild_name))
-    await ctx.send("GP exported")
 
 
 #sync counters
@@ -871,12 +875,7 @@ async def whois(ctx, *, term: str = None):
 @commands.has_role("Moderator")
 async def conflicts(ctx, IOguild: str = None):
     """Link rows that need attention. Also runs as part of the weekly cycle."""
-    if IOguild is not None and IOguild not in logic.GUILD_NAMES:
-        await ctx.send(f"Unknown guild '{IOguild}'. Pick one of: {', '.join(logic.GUILD_NAMES)}")
-        return
-
-    for guild_name in ([IOguild] if IOguild else logic.GUILD_NAMES):
-        await Functions.conflicts(ctx, guild_name, announce_clean=True)
+    await send_guild_sections(ctx, IOguild, Functions.conflicts_report, "no link conflicts found.")
 
 @bot.command(name='relink')
 @commands.has_role("Moderator")
@@ -936,12 +935,23 @@ async def gp_audit(ctx, IOguild: str = None):
     Replies in the invoking channel rather than the mod channel, since a
     moderator asking for it on demand wants to see the answer where they asked.
     """
+    await send_guild_sections(ctx, IOguild, Functions.gp_audit_report, "nobody flagged.")
+
+
+async def send_guild_sections(ctx, IOguild, build, clean_text):
+    """One reply for a per-guild report command: embeds for the guilds with
+    something to report, a line for each that has nothing."""
     if IOguild is not None and IOguild not in logic.GUILD_NAMES:
         await ctx.send(f"Unknown guild '{IOguild}'. Pick one of: {', '.join(logic.GUILD_NAMES)}")
         return
 
+    embeds, clean = [], []
     for guild_name in ([IOguild] if IOguild else logic.GUILD_NAMES):
-        await Functions.gp_audit(ctx, guild_name)
+        section = build(guild_name)
+        embeds.extend(section)
+        if not section:
+            clean.append(f"{guild_name}: {clean_text}")
+    await send_embeds(ctx, embeds, "\n".join(clean) or None)
 
 #baba pings
 async def baba_ping():
@@ -966,11 +976,11 @@ async def baba_ping():
             await asyncio.sleep(40)
 
 #does weekly GP things
-async def run_weekly_gp(ack_channel):
+async def run_weekly_gp(ack_channel=None):
     """Run the weekly cycle with the invite poll held off {guild}_game.
 
     Wraps the whole cycle, not just the reporting part: the window that matters
-    is between members_guild's export and GP_databases reading it, which sits
+    is between the roster export and GP_databases reading it, which sits
     before the cycle's own try block.
     """
     with Functions.weekly_job():
@@ -982,12 +992,11 @@ async def _run_weekly_gp(ack_channel):
     columns, reassign rank roles, report low-GP members, implausible gains and
     link problems, and back up the DB.
 
-    ack_channel receives only the "GP exported" acknowledgement -- the invoking
-    channel for !GP_weekly, the mod channel for the scheduled run. The reports
-    themselves always go to the mod channel, so the weekly history stays in one
-    place no matter where the command was typed. This used to be two
-    near-identical copies that would have drifted apart the first time only one
-    of them was updated.
+    Everything is posted to the mod channel as one report, at the end, so the
+    weekly history stays in one place no matter where !GP_weekly was typed.
+    ack_channel is the invoking context for !GP_weekly (None for the scheduled
+    run); it only hears that the run finished, and only when it is a different
+    channel.
     """
     print("Starting weekly GP process")
 
@@ -996,24 +1005,16 @@ async def _run_weekly_gp(ack_channel):
     run_key = (await Functions.get_date())["column_name1"]
     await Functions.mark_weekly_run_started(run_key)
 
-    await members_guild(ack_channel)
+    await export_game_rosters()
     await Functions.GP_databases()
 
+    report = []
+    failure = None
     try:
         for guild_name in logic.GUILD_NAMES:
-            monthly_gp_df = await Functions.GP_dataframe(guild_name)
-            # Only one guild runs the GP rank ladder and the Monthly Top role.
-            if guild_name == logic.RANK_ROLE_GUILD:
-                roles_status = await Functions.GP_roles(bot, monthly_gp_df)
-                if roles_status is None:
-                    await LedukasSpam_channel.send("GP roles fixed!")
-                else:
-                    await LedukasSpam_channel.send(f"GP roles not fully synced: {roles_status}")
-            await Functions.red_gp(LedukasSpam_channel, monthly_gp_df, guild_name)
-            await Functions.gp_audit(LedukasSpam_channel, guild_name)
-            # Silent unless there is something to report -- announce_clean
-            # stays at its default here on purpose.
-            await Functions.conflicts(LedukasSpam_channel, guild_name)
+            guild_failure = await collect_guild_report(guild_name, report, sync_roles=True)
+            if failure is None:
+                failure = guild_failure
         #await Functions.promotions(bot, LedukasSpam_channel)
     finally:
         # In a finally because GP_databases above has already written this
@@ -1024,24 +1025,90 @@ async def _run_weekly_gp(ack_channel):
         # commits Functions.conn, and GP_databases commits the connection it
         # opens itself.
         print("weekly GP calculated")
+        backup_name = None
         try:
-            backup_path = run_backup()
-            backup_message = f"Weekly backup created: `{backup_path.name}`"
+            backup_name = run_backup().name
         except Exception as e:
             print(e)
-            backup_message = f"Weekly backup failed: {e}"
+            report.append(logic.failure_embed("Weekly backup failed", e))
+        content, embeds = logic.finish_weekly_report(
+            logic.weekly_report_heading(run_key), report, backup_name
+        )
         # Nothing in this finally may raise: an exception here would replace the
         # one that brought us into it and hide why the cycle actually failed.
         try:
-            await LedukasSpam_channel.send(backup_message)
+            await send_embeds(LedukasSpam_channel, embeds, content)
         except Exception as e:
-            print(f"could not report backup status: {e}", file=sys.stderr)
+            print(f"could not post the weekly report: {e}", file=sys.stderr)
+            try:
+                await LedukasSpam_channel.send(f"The weekly report could not be posted: {e}")
+            except Exception as fallback_error:
+                print(f"could not report that either: {fallback_error}", file=sys.stderr)
+
+    # Re-raised only now, after the report is out: it is what makes
+    # gp_weekly_loop (or on_command_error, for !GP_weekly) say the run failed.
+    if failure is not None:
+        raise failure
+    if ack_channel is not None and ack_channel.channel.id != LedukasSpam_channelID:
+        await ack_channel.send(f"Weekly run finished -- the report is in <#{LedukasSpam_channelID}>.")
+
+
+async def collect_guild_report(guild_name, report, sync_roles):
+    """Append one guild's sections of the weekly report to `report`.
+
+    Returns the first exception that cost the guild a section, or None. A
+    failed step becomes an error embed and the sections that don't depend on
+    it still run -- Aetherians goes first, so a role-sync hiccup used to cost
+    Pretherians its whole report.
+    """
+    failure = None
+    try:
+        monthly_gp_df = await Functions.GP_dataframe(guild_name)
+    except Exception as e:
+        failure = _record_failure(report, f"{guild_name} -- GP table failed", e)
+    else:
+        # Only one guild runs the GP rank ladder and the Monthly Top role.
+        if sync_roles and guild_name == logic.RANK_ROLE_GUILD:
+            try:
+                roles_status = await Functions.GP_roles(bot, monthly_gp_df)
+            except Exception as e:
+                failure = _record_failure(report, f"{guild_name} -- rank roles failed", e)
+            else:
+                if roles_status is not None:
+                    report.append(logic.warning_embed(
+                        f"{guild_name} -- rank roles", f"Not fully synced: {roles_status}"
+                    ))
+        report.extend(Functions.red_gp_report(monthly_gp_df, guild_name))
+    report.extend(Functions.gp_audit_report(guild_name))
+    report.extend(Functions.conflicts_report(guild_name))
+    return failure
+
+
+def _record_failure(report, title, error):
+    traceback.print_exception(type(error), error, error.__traceback__)
+    report.append(logic.failure_embed(title, error))
+    return error
 
 
 @bot.command(name='GP_weekly')
 @commands.has_role("Moderator")
 async def GP_weekly_man(ctx):
     await run_weekly_gp(ctx)
+
+
+@bot.command(name='weekly_report')
+@commands.has_role("Moderator")
+async def weekly_report(ctx):
+    """The latest week's report again, here, without running anything: no
+    export, no snapshot, no role changes, no backup."""
+    run_key = (await Functions.get_date())["column_name1"]
+    report = []
+    for guild_name in logic.GUILD_NAMES:
+        await collect_guild_report(guild_name, report, sync_roles=False)
+    content, embeds = logic.finish_weekly_report(
+        logic.weekly_report_heading(run_key, preview=True), report, None
+    )
+    await send_embeds(ctx, embeds, content)
 
 
 ##---------------------------------------------  Functions
@@ -1081,7 +1148,7 @@ async def gp_weekly_loop():
     # and the only sign would be a missing weekly report. Same permanent-death
     # mode baba_ping was hardened against.
     try:
-        await run_weekly_gp(LedukasSpam_channel)
+        await run_weekly_gp()
     except Exception as e:
         print(f"weekly GP job failed: {e}", file=sys.stderr)
         traceback.print_exception(type(e), e, e.__traceback__)
@@ -1107,6 +1174,29 @@ async def report_to_mods(text):
         print(f"(mod channel unavailable) {text}", file=sys.stderr)
         return
     await LedukasSpam_channel.send(text, allowed_mentions=discord.AllowedMentions.none())
+
+
+async def send_embeds(destination, embeds, content=None):
+    """Post a report in as few messages as Discord's embed limits allow,
+    with `content` on the first. `destination` is a channel or a Context."""
+    channel = getattr(destination, 'channel', destination)
+    guild = getattr(channel, 'guild', None)
+    if embeds and guild is not None and not channel.permissions_for(guild.me).embed_links:
+        # Without it Discord drops the embeds and posts only the content line,
+        # which would look like a report with nothing in it.
+        notice = "I can't show this report here: I need the Embed Links permission in this channel."
+        await destination.send(
+            f"{content}\n{notice}" if content else notice,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return
+    messages = logic.pack_messages(embeds) or ([[]] if content else [])
+    for index, batch in enumerate(messages):
+        await destination.send(
+            content if index == 0 else None,
+            embeds=batch,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
 
 
 @tasks.loop(seconds=10)

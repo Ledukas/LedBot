@@ -154,23 +154,23 @@ class TestFormatConflicts:
     def test_nothing_to_report_is_none(self):
         """The weekly job's silence depends on this exactly: None means send
         nothing, and only the manual command turns that into a line."""
-        assert logic.format_conflicts("Aetherians", [], []) is None
+        assert logic.format_conflicts([], []) is None
 
     def test_a_split_names_both_accounts(self):
         rows = [link(1, 111, "X"), link(2, 222, "X")]
         characters, accounts = logic.find_link_conflicts(rows, {"X": ("Someone", 1)})
-        report = logic.format_conflicts("Aetherians", characters, accounts)
+        report = logic.format_conflicts(characters, accounts)
         assert "111" in report and "222" in report
         assert "!relink" in report
 
-    def test_fits_in_a_discord_message(self):
+    def test_fits_in_an_embed(self):
         rows = []
         for n in range(30):
             rows += [link(n * 2, 1000 + n, f"G{n}"), link(n * 2 + 1, 2000 + n, f"G{n}")]
         live = {f"G{n}": (f"character_number_{n}", 1) for n in range(30)}
         characters, accounts = logic.find_link_conflicts(rows, live)
-        report = logic.format_conflicts("Aetherians", characters, accounts)
-        assert len(report) < logic.DISCORD_MESSAGE_LIMIT
+        report = logic.format_conflicts(characters, accounts)
+        assert len(report) < logic.EMBED_DESCRIPTION_LIMIT
 
     def test_fits_with_both_kinds_at_once(self):
         """The case the single-block test above misses. Sizing each block
@@ -189,8 +189,8 @@ class TestFormatConflicts:
             live[f"H{n}"] = (f"alt_character_{n}", 1)
         characters, accounts = logic.find_link_conflicts(rows, live)
         assert characters and accounts, "this fixture must produce both kinds"
-        report = logic.format_conflicts("Aetherians", characters, accounts)
-        assert len(report) < logic.DISCORD_MESSAGE_LIMIT
+        report = logic.format_conflicts(characters, accounts)
+        assert len(report) < logic.EMBED_DESCRIPTION_LIMIT
 
 
 class TestPlanRelink:

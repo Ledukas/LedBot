@@ -10,8 +10,8 @@ and holds its own copy, but importing it builds a live Google Sheets client and
 reads .env at import time, which would cost this script the one property worth
 having: it runs against a database copy on any machine, with no credentials.
 
-The output is the Discord message verbatim, Markdown and all, so this doubles
-as a preview of what a moderator will see.
+The output is the embed's title and body verbatim, Markdown and all, so this
+doubles as a preview of what a moderator will see.
 """
 
 import argparse
@@ -82,7 +82,9 @@ def main() -> int:
         )
         print(f"\n{'-' * 72}")
         print(f"{len(members)} on the {guild} roster")
-        print(logic.format_gp_audit(guild, sustained, spiked, weeks=args.weeks, hits=args.hits))
+        body = logic.format_gp_audit(sustained, spiked, weeks=args.weeks, hits=args.hits)
+        print(f"{guild} -- GP audit")
+        print(body if body is not None else "Nobody flagged.")
 
     conn.close()
     return 0

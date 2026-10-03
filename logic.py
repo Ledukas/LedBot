@@ -13,8 +13,10 @@ command_error_message. Those are noted in TODO.md as fixed.
 """
 
 from datetime import datetime
+import math
 import re
 
+import discord
 import pandas as pd
 from discord.ext import commands
 
@@ -306,13 +308,12 @@ def filter_gp_audit(
 
 
 def format_gp_audit(
-    io_guild: str,
     sustained: list[tuple[int, str, list[int]]],
     spiked: list[tuple[int, str]],
     weeks: int = GP_AUDIT_WEEKS,
     hits: int = GP_AUDIT_HITS,
-) -> str:
-    """Render one guild's audit as a Discord message.
+) -> str | None:
+    """One guild's audit as an embed body, or None when nobody is flagged.
 
     Always names the figures that produced a flag. This report exists to start
     an investigation, not to conclude one, and a moderator cannot judge a name
@@ -323,8 +324,10 @@ def format_gp_audit(
     the single-row version either truncated those mid-name or pushed the line
     wide enough to wrap in a phone's code block.
     """
-    lines = [f"**{io_guild} -- GP audit**"]
+    if not sustained and not spiked:
+        return None
 
+    lines = []
     if sustained:
         lines.append(f"Above {GP_GAIN_BAR} in {hits}+ of the last {weeks} weeks:")
         block = "\n".join(
@@ -355,8 +358,7 @@ def format_table_block(
 ) -> str:
     """Render a dataframe as a left-padded, separator-joined monospace text
     block: one header line (from df.columns) followed by one line per row,
-    each line ending in '\\n'. Shared by red_gp and mygains2, which used to
-    duplicate this formatting independently.
+    each line ending in '\\n'. Used by !mygains.
     """
     columns = list(df.columns)
     header = str(columns[0]).ljust(first_col_width)
@@ -372,6 +374,215 @@ def format_table_block(
         data += '\n'
 
     return header + data
+
+
+# ---------------------------------------------------------------------------
+# Report embeds -- the weekly report and the manual commands that share its
+# sections. An embed's description holds 4096 characters against a plain
+# message's 2000, which is what lets the red list stop being a .txt attachment.
+# ---------------------------------------------------------------------------
+
+# Discord rejects the whole send if any of these is exceeded. The total covers
+# every embed on one message; len(discord.Embed) counts exactly those fields.
+EMBED_DESCRIPTION_LIMIT = 4096
+EMBED_TOTAL_LIMIT = 6000
+EMBEDS_PER_MESSAGE = 10
+
+GUILD_COLORS = {"Aetherians": 0x3498DB, "Pretherians": 0x2ECC71}
+NEUTRAL_COLOR = 0x95A5A6
+WARNING_COLOR = 0xF1C40F
+ERROR_COLOR = 0xE74C3C
+
+TRUNCATED_NOTE = "...truncated"
+
+RED_GP_NAME_WIDTH = 15
+RED_GP_VALUE_WIDTH = 4
+
+
+def guild_color(io_guild: str) -> int:
+    return GUILD_COLORS.get(io_guild, NEUTRAL_COLOR)
+
+
+def _fit_description(body: str, limit: int = EMBED_DESCRIPTION_LIMIT) -> str:
+    """body, cut at a line boundary if it is over the limit.
+
+    A safety net, not a layout tool: the reports that can grow are sized or
+    chunked before they get here. This only stops an unexpected body -- a long
+    exception message, a freak audit -- from making Discord reject the send,
+    which would lose every other section of the report with it.
+    """
+    if len(body) <= limit:
+        return body
+    reserve = len("\n```") + len("\n" + TRUNCATED_NOTE)
+    kept: list[str] = []
+    used = 0
+    in_fence = False
+    for line in body.split("\n"):
+        room = limit - reserve - used
+        if len(line) + 1 > room:
+            if not kept:
+                kept.append(line[:max(room - 1, 0)])
+            break
+        kept.append(line)
+        used += len(line) + 1
+        if line.startswith("```"):
+            in_fence = not in_fence
+    if in_fence:
+        kept.append("```")
+    kept.append(TRUNCATED_NOTE)
+    return "\n".join(kept)
+
+
+def report_embed(title: str, body: str, color: int) -> discord.Embed:
+    return discord.Embed(title=title, description=_fit_description(body), colour=color)
+
+
+def warning_embed(title: str, text: str) -> discord.Embed:
+    return report_embed(title, text, WARNING_COLOR)
+
+
+def failure_embed(title: str, error: BaseException) -> discord.Embed:
+    return report_embed(title, f"{type(error).__name__}: {error}", ERROR_COLOR)
+
+
+def section_embeds(io_guild: str, section: str, body: str | None) -> list[discord.Embed]:
+    """One guild's report section as embeds; [] when the formatter had nothing
+    to say. Silence is the caller's decision -- the weekly report posts nothing
+    for it, the manual commands say so."""
+    if body is None:
+        return []
+    return [report_embed(f"{io_guild} -- {section}", body, guild_color(io_guild))]
+
+
+def gp_date_label(column: str) -> str:
+    """'GP2026_10_03' or '10_03' as '10/3' -- the snapshot columns and the
+    dataframe's renamed ones both end in month_day."""
+    month, day = column.split('_')[-2:]
+    return f"{int(month)}/{int(day)}"
+
+
+def current_names(df: pd.DataFrame, names_by_gid: dict) -> pd.DataFrame:
+    """A copy of df with each Name replaced by the character's current one.
+
+    The GP tables keep whatever name a member had when GP_databases first
+    inserted their row, so a third of a guild can show under a former name.
+    Falls back to the stored name for an id that isn't in the roster. Returns
+    a copy: the caller's dataframe is shared with GP_roles.
+    """
+    known = {g_id: name for g_id, name in names_by_gid.items() if name}
+    return df.assign(Name=df['G_ID'].map(known).fillna(df['Name']))
+
+
+def _gp_cell(value) -> str:
+    if pd.isna(value):
+        return "-"
+    return str(math.floor(float(value) + 0.5))
+
+
+def format_red_gp(io_guild: str, df: pd.DataFrame) -> list[discord.Embed]:
+    """filter_red_gp's output as a table: one line per member, about 40
+    characters, so it reads inside an embed on a phone. [] when nobody is red.
+
+    Chunked into several embeds rather than truncated: the red list is the one
+    report with no natural size. An in-game event week can put most of a guild
+    on it, and every name on it is one a moderator may act on.
+    """
+    if df.empty:
+        return []
+    week_columns = list(df.columns[1:5])
+    header = (
+        "Name".ljust(RED_GP_NAME_WIDTH) + " "
+        + " ".join(gp_date_label(column).rjust(RED_GP_VALUE_WIDTH) for column in week_columns)
+        + " " + "avg".rjust(RED_GP_VALUE_WIDTH)
+    )
+    rows = [
+        str(row['Name']).ljust(RED_GP_NAME_WIDTH) + " "
+        + " ".join(_gp_cell(row[column]).rjust(RED_GP_VALUE_WIDTH) for column in week_columns)
+        + " " + _gp_cell(row['Average']).rjust(RED_GP_VALUE_WIDTH)
+        for _, row in df.iterrows()
+    ]
+    return table_embeds(
+        f"{io_guild} -- red GP ({len(rows)})", header, rows, guild_color(io_guild)
+    )
+
+
+def table_embeds(
+    title: str,
+    header: str,
+    rows: list[str],
+    color: int,
+    limit: int = EMBED_DESCRIPTION_LIMIT,
+) -> list[discord.Embed]:
+    """rows in a code block, split across as many embeds as the limit needs,
+    each repeating the header so a continuation still reads as a table."""
+    overhead = len("```\n") + len(header) + len("\n```")
+    chunks: list[list[str]] = []
+    current: list[str] = []
+    used = overhead
+    for row in rows:
+        if current and used + len(row) + 1 > limit:
+            chunks.append(current)
+            current, used = [], overhead
+        current.append(row)
+        used += len(row) + 1
+    chunks.append(current)
+    return [
+        report_embed(
+            title if index == 0 else f"{title} (cont.)",
+            "```\n" + "\n".join([header, *chunk]) + "\n```",
+            color,
+        )
+        for index, chunk in enumerate(chunks)
+    ]
+
+
+def pack_messages(
+    embeds: list[discord.Embed],
+    per_message: int = EMBEDS_PER_MESSAGE,
+    total: int = EMBED_TOTAL_LIMIT,
+) -> list[list[discord.Embed]]:
+    """Embeds grouped into as few messages as Discord's limits allow, in order."""
+    messages: list[list[discord.Embed]] = []
+    current: list[discord.Embed] = []
+    used = 0
+    for embed in embeds:
+        size = len(embed)
+        if current and (len(current) >= per_message or used + size > total):
+            messages.append(current)
+            current, used = [], 0
+        current.append(embed)
+        used += size
+    if current:
+        messages.append(current)
+    return messages
+
+
+def weekly_report_heading(column_name: str, preview: bool = False) -> str:
+    label = "Report preview" if preview else "Weekly report"
+    return f"**{label} -- week ending {gp_date_label(column_name)}**"
+
+
+def finish_weekly_report(
+    heading: str,
+    embeds: list[discord.Embed],
+    backup_name: str | None,
+) -> tuple[str, list[discord.Embed]]:
+    """The content line and embeds for one weekly post.
+
+    Never empty: a week with nothing to report still posts its heading, so a
+    quiet week can be told apart from a job that never ran. The backup's name
+    rides in the last embed's footer, or on the heading when there are no
+    embeds. A footer renders no markdown; the heading needs the backticks,
+    since backup names contain underscores.
+    """
+    if not embeds:
+        content = f"{heading} -- nothing to report."
+        if backup_name:
+            content += f" Backup: `{backup_name}`"
+        return content, []
+    if backup_name:
+        embeds[-1].set_footer(text=f"Backup: {backup_name}")
+    return heading, embeds
 
 
 def extract_cell_value(values: list, default: str = "No strategy available yet") -> str:
@@ -578,14 +789,13 @@ def character_name(entry) -> str | None:
     return entry
 
 
-# Discord rejects a message over 2000 characters outright. Budgeting the body
-# rather than capping the number of entries is what makes that safe regardless
-# of how long the names in them turn out to be. One budget for the whole
-# message, not one per block: two blocks each sized against the limit add up to
-# twice the limit, and the headers, fences and "...and N more" lines are on top
-# of that again.
-DISCORD_MESSAGE_LIMIT = 2000
-CONFLICT_REPORT_BUDGET = 1500
+# The report is an embed description, which Discord rejects over 4096
+# characters. Budgeting the body rather than capping the number of entries is
+# what makes that safe regardless of how long the names in them turn out to be.
+# One budget for the whole report, not one per block: two blocks each sized
+# against the limit add up to twice the limit, and the headings, fences and
+# "...and N more" lines are on top of that again.
+CONFLICT_REPORT_BUDGET = 3500
 
 
 def _fit_entries(entries: list[list[str]], budget: int) -> tuple[list[str], int]:
@@ -624,7 +834,6 @@ def unlinked_characters(link_rows: list[dict], live_characters: dict) -> list[tu
 
 
 def format_conflicts(
-    io_guild: str,
     character_conflicts: list[dict],
     account_conflicts: list[dict],
     unlinked: list[tuple] = (),
@@ -643,7 +852,7 @@ def format_conflicts(
     if not character_conflicts and not account_conflicts and not unlinked:
         return None
 
-    lines = [f"**{io_guild} -- link conflicts**"]
+    lines = []
     # Drawn down by each block, so the second one gets what the first left
     # rather than a second full allowance.
     remaining = budget
@@ -671,7 +880,7 @@ def format_conflicts(
         lines.append("```\n" + "\n".join(body) + "\n```")
         remaining -= sum(len(line) + 1 for line in body)
         if omitted:
-            lines.append(f"...and {omitted} more character(s); run !conflicts for one guild.")
+            lines.append(f"...and {omitted} more character(s).")
 
     if account_conflicts:
         entries = [

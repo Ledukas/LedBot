@@ -290,8 +290,12 @@ async def GP_roles(bot, monthly_gp_df):
     return None
                 
 #red GP
-async def red_gp(channel, monthly_gp_df, IOguild):
+def red_gp_report(monthly_gp_df, IOguild):
+    """Members below the guild's weekly GP bar, as embeds; [] when nobody is.
 
+    Named from {guild}_game rather than the GP table, whose names are frozen at
+    the member's first snapshot -- the same reason _load_gp_series joins there.
+    """
     Blacklist = [
         'bvK1B5ngXtgiw5MV95mE6BOP2rN2', #Ledukas, Aetherians
         '0dzrUrtCeOdllJBa8LXoYQCo4Fv1', #Ledukas, Pretherians
@@ -299,21 +303,16 @@ async def red_gp(channel, monthly_gp_df, IOguild):
         'TQvhMJ1oAIfRXrvffVGN3Jy0Zdi1' #Led_Bot, Pretherians
         ]
     try:
-        df_red_gp = logic.filter_red_gp(monthly_gp_df, IOguild, Blacklist)
+        names_by_gid = dict(c.execute(
+            f"SELECT G_ID, G_NAME FROM {logic.table_name(IOguild, 'game')}"
+        ).fetchall())
+        df_red_gp = logic.filter_red_gp(
+            logic.current_names(monthly_gp_df, names_by_gid), IOguild, Blacklist
+        )
+        return logic.format_red_gp(IOguild, df_red_gp)
     except Exception as e:
-        # Bails out cleanly here instead of continuing on with an undefined
-        # df_red_gp, which is what the old version did on any failure here.
         print("line: " + str(inspect.currentframe().f_lineno) + "\n error: " + str(e))
-        await channel.send(f"Error building red-GP report: {e}")
-        return
-
-    with open('red.txt', 'w') as file:
-        file.write(f'{IOguild} \n')
-        file.write(logic.format_table_block(df_red_gp))
-
-    file = discord.File('red.txt')
-    await channel.send(file=file)
-    os.remove('red.txt')
+        return [logic.failure_embed(f"{IOguild} -- red GP failed", e)]
 
 GP_COLUMN_RE = re.compile(r'^GP(\d{4})_(\d{2})_(\d{2})$')
 
@@ -359,22 +358,15 @@ def _load_gp_series(IOguild):
     return members
 
 
-async def gp_audit(channel, IOguild):
-    """Report members whose weekly GP gains are worth a closer look.
-
-    The mirror of red_gp. Sent as a message rather than a .txt attachment
-    because it names a handful of members at most, and one a moderator is
-    meant to act on should be readable without opening a file.
-    """
+def gp_audit_report(IOguild):
+    """Members whose weekly GP gains are worth a closer look, as embeds; []
+    when nobody is flagged. The mirror of red_gp_report."""
     try:
-        members = _load_gp_series(IOguild)
+        sustained, spiked = logic.filter_gp_audit(_load_gp_series(IOguild))
     except Exception as e:
         print("line: " + str(inspect.currentframe().f_lineno) + "\n error: " + str(e))
-        await channel.send(f"Error building GP audit for {IOguild}: {e}")
-        return
-
-    sustained, spiked = logic.filter_gp_audit(members)
-    await channel.send(logic.format_gp_audit(IOguild, sustained, spiked))
+        return [logic.failure_embed(f"{IOguild} -- GP audit failed", e)]
+    return logic.section_embeds(IOguild, "GP audit", logic.format_gp_audit(sustained, spiked))
 
 
 def _load_link_snapshot(IOguild):
@@ -423,15 +415,11 @@ def _load_link_snapshot(IOguild):
     return links, live_characters, live_accounts
 
 
-async def conflicts(channel, IOguild, announce_clean=False):
-    """Report link rows needing attention; silent by default when there are none.
+def conflicts_report(IOguild):
+    """Link rows needing attention, as embeds; [] when there are none.
 
-    announce_clean defaults to False so that an automated caller added to the
-    weekly cycle later cannot start posting "nothing to report" every Saturday
-    just by forgetting the argument. The manual command opts in.
-
-    Load failures are always reported, even on the silent path -- otherwise a
-    crash and a clean week look identical in the mod channel.
+    A load failure comes back as an error embed, never as [] -- otherwise a
+    crash and a clean week would look identical in the mod channel.
     """
     try:
         links, live_characters, _ = _load_link_snapshot(IOguild)
@@ -439,15 +427,11 @@ async def conflicts(channel, IOguild, announce_clean=False):
         unlinked = logic.unlinked_characters(links, live_characters)
     except Exception as e:
         print("line: " + str(inspect.currentframe().f_lineno) + "\n error: " + str(e))
-        await channel.send(f"Error building the link-conflict report for {IOguild}: {e}")
-        return
-
-    message = logic.format_conflicts(IOguild, character_conflicts, account_conflicts, unlinked)
-    if message is None:
-        if announce_clean:
-            await channel.send(f"{IOguild}: no link conflicts found.")
-        return
-    await channel.send(message)
+        return [logic.failure_embed(f"{IOguild} -- link conflicts failed", e)]
+    return logic.section_embeds(
+        IOguild, "link conflicts",
+        logic.format_conflicts(character_conflicts, account_conflicts, unlinked),
+    )
 
 
 def _recent_gains(IOguild, g_ids):

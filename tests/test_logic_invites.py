@@ -538,19 +538,19 @@ class TestInviteMessages:
 
 class TestConflictReportUnlinkedSection:
     def test_unlinked_characters_alone_make_a_report(self):
-        text = logic.format_conflicts(GUILD, [], [], [("KingBob531", "X")])
+        text = logic.format_conflicts([], [], [("KingBob531", "X")])
         assert "KingBob531" in text
 
     def test_nothing_at_all_is_still_none(self):
         """The weekly job's silence depends on this."""
-        assert logic.format_conflicts(GUILD, [], [], []) is None
+        assert logic.format_conflicts([], [], []) is None
 
     def test_unlinked_characters_come_from_usable_links(self):
         live = {"X": ("Linked", 1), "Y": ("NoAccount", 1), "Z": ("Unassigned", 1)}
         links = [{'g_id': "X", 'd_id': "1"}, {'g_id': "Y", 'd_id': None}]
         assert logic.unlinked_characters(links, live) == [("NoAccount", "Y"), ("Unassigned", "Z")]
 
-    def test_all_three_sections_together_fit_a_message(self):
+    def test_all_three_sections_together_fit_an_embed(self):
         """A bad week -- conflicts, alts and unlinked characters at once --
         shares one budget, so it can't exceed Discord's limit."""
         rows = []
@@ -566,6 +566,6 @@ class TestConflictReportUnlinkedSection:
             live[f"H{n}"] = (f"alt_character_{n}", 1)
         characters, accounts = logic.find_link_conflicts(rows, live)
         unlinked = [(f"unassigned_character_{n}", f"U{n:025d}") for n in range(60)]
-        text = logic.format_conflicts(GUILD, characters, accounts, unlinked)
+        text = logic.format_conflicts(characters, accounts, unlinked)
         assert characters and accounts
-        assert len(text) < logic.DISCORD_MESSAGE_LIMIT
+        assert len(text) < logic.EMBED_DESCRIPTION_LIMIT
