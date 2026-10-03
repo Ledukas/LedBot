@@ -979,7 +979,8 @@ async def run_weekly_gp(ack_channel):
 
 async def _run_weekly_gp(ack_channel):
     """One weekly GP cycle: refresh in-game GP, roll this week's snapshot
-    columns, reassign rank roles, report low-GP members, and back up the DB.
+    columns, reassign rank roles, report low-GP members, implausible gains and
+    link problems, and back up the DB.
 
     ack_channel receives only the "GP exported" acknowledgement -- the invoking
     channel for !GP_weekly, the mod channel for the scheduled run. The reports
@@ -1054,7 +1055,8 @@ async def GP_weekly_man(ctx):
 # the snapshot columns are named after, and stays correct across DST, which a
 # fixed UTC offset captured at import would not.
 #
-# _last_weekly_run_date makes the several ticks inside the 2 AM hour idempotent.
+# The weekly_runs marker that run_weekly_gp writes makes the several ticks
+# inside the 2 AM hour, and a restart within it, run the job once.
 # tasks.loop is still what runs it, for its start()/is_running() lifecycle: a
 # gateway reconnect re-firing on_ready cannot spawn a second copy, which is what
 # used to send the weekly report twice.
