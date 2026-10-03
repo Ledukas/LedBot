@@ -13,6 +13,8 @@ Then place the two secret files in the repo root (never committed — see `.giti
 - `.env` — see the variables listed in `CLAUDE.md`
 - `service_account.json` — Google service account credentials for the boss-strategy sheet lookup
 
+The three welcome-channel ids in `.env` (`WELCOME_POST_CHANNEL_ID`, `WELCOME_INFO_CHANNEL_ID`, `ROLES_CHANNEL_ID`) are optional: without them the bot still starts, and the invite auto-link still links members and gives roles, but skips the welcome post and says so in the mod channel. Add them when updating an existing Pi.
+
 ## Installing the systemd unit
 
 `systemd/ledbot.service` has `User=pi` and `/home/pi/LedBot` as placeholders — edit both to match your actual username and the path you cloned the repo to before installing.
@@ -21,9 +23,16 @@ Then place the two secret files in the repo root (never committed — see `.giti
 sudo cp systemd/ledbot.service /etc/systemd/system/
 sudo systemctl daemon-reload
 
+# Make "time-sync.target" actually wait for NTP (the unit is ordered after it)
+sudo systemctl enable systemd-time-wait-sync
+
 # Start now and on every boot
 sudo systemctl enable --now ledbot.service
 ```
+
+**Why the time sync:** the Pi has no clock battery, so after a boot its clock can be hours out until NTP syncs. The invite auto-link times invites in wall-clock seconds, and an invite recorded on a wrong clock would look hours old and expire at once when the clock corrects; the weekly 2 AM job is exposed to the same jump. With `systemd-time-wait-sync` enabled the bot waits for a synced clock before starting. Side effect: after a boot with **no network**, the bot waits rather than starting — which is fine, since it can't do anything offline anyway.
+
+After pulling a change to `systemd/ledbot.service`, re-run the `cp` and `daemon-reload` lines above before restarting.
 
 ## Everyday operations
 

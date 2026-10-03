@@ -5,9 +5,9 @@ from discord.ext.commands.bot import Bot
 import pandas as pd
 import sqlite3
 import os
-import json
 from dotenv import load_dotenv
 import requests
+import urllib3
 import shlex
 from datetime import datetime, timedelta, time
 import inspect
@@ -16,6 +16,8 @@ import random
 import sys
 import traceback
 import functools
+# Aliased: `time` is already taken above by datetime.time.
+from time import time as epoch_now
 
 import Functions
 import logic
@@ -32,6 +34,12 @@ LedukasSpam_channelID = int(os.environ.get('SPAM_CHANNEL_ID'))
 # Resolved in on_ready. Defined here so the `is None` guards that read it are
 # correct on their own terms rather than relying on on_ready having run first.
 LedukasSpam_channel = None
+# Where the invite auto-link posts its welcome, and the two channels the
+# welcome links to. Optional: a missing one skips the welcome with a note in
+# the mod channel instead of stopping the bot at import.
+WELCOME_POST_CHANNEL_ID = logic.parse_optional_id(os.environ.get('WELCOME_POST_CHANNEL_ID'))
+WELCOME_INFO_CHANNEL_ID = logic.parse_optional_id(os.environ.get('WELCOME_INFO_CHANNEL_ID'))
+ROLES_CHANNEL_ID = logic.parse_optional_id(os.environ.get('ROLES_CHANNEL_ID'))
 email_a = os.environ.get('EMAIL_A')
 email_p = os.environ.get('EMAIL_P')
 
@@ -51,6 +59,9 @@ roles_to_remove = {
     'removeroles': list(logic.GUILD_NAMES) + logic.RANK_ROLE_NAMES,
     'giverole': 'Former Aetherian',
 }
+# !kick hands this out, so a returning member arrives carrying it; the invite
+# auto-link takes it back off.
+FORMER_ROLE_NAME = roles_to_remove['giverole']
 
 # Only the email mapping is local -- the guild ids live in logic.GUILD_GIDS.
 guild_emails = {"Aetherians": email_a, "Pretherians": email_p}
@@ -164,7 +175,11 @@ async def members_discord(ctx):
 @bot.command(name='members_game')
 @commands.has_role("Moderator")
 async def members_guild(ctx):
-    await Functions.GP_export(email_a, email_p)
+    # The same non-blocking roster read and cached login the invite poll uses.
+    # This was pyrebase, which is synchronous and froze the whole bot --
+    # the invite poll included -- for the length of the export.
+    for guild_name in logic.GUILD_NAMES:
+        Functions.write_game_roster(guild_name, await fetch_guild_roster(guild_name))
     await ctx.send("GP exported")
 
 
@@ -329,6 +344,11 @@ async def assign(ctx, IOguild, user_param, game_name):
 
         c.execute('INSERT INTO ' + table_name_members + ' (Discord, D_ID, Display, G_ID, G_NAME) VALUES (?,?,?,?,?)',
                     (user.name + '#' + user.discriminator, user.id, user.display_name, game[2], game[1]))
+        # Committed before replying. Held open across the await, this write lock
+        # makes any other writer -- the invite poll refreshing the roster -- wait
+        # on it synchronously, which blocks the loop so this coroutine can never
+        # resume to commit; the other write fails after 5 s.
+        conn.commit()
 
         await ctx.send(f"Assigned {game_name} to {user.display_name}, {user.id}")
     else:
@@ -337,86 +357,322 @@ async def assign(ctx, IOguild, user_param, game_name):
     conn.commit()
 
 
-async def post_json(url, json=None, headers=None):
-    """requests.post, run off the event loop.
+HTTP_TIMEOUT = (5, 20)  # connect, read -- seconds
 
-    requests is synchronous, so calling it straight from an async command
-    handler blocks the whole bot for the length of the round trip -- every
-    other command stalls behind it, which on the Pi's connection is very
-    noticeable. Functions.get_cell_value already offloads its blocking Google
-    call the same way.
+
+class FirebaseRequestError(Exception):
+    """A request to the game's backend failed. The message is already redacted.
+
+    maybe_sent is False only when the connection never opened -- the one case
+    where a POST certainly did not reach the game.
+    """
+
+    def __init__(self, message, maybe_sent):
+        super().__init__(message)
+        self.maybe_sent = maybe_sent
+
+
+async def _request(method, url, **kwargs):
+    """A requests call run off the event loop, with a timeout and no secrets in errors.
+
+    requests is synchronous, so calling it straight from an async handler blocks
+    the whole bot for the round trip. It also had no timeout: a request that
+    never answered held its thread forever, and since the invite poll's loop
+    awaits each tick, one hung read would stop polling for good.
+
+    Errors are re-raised with tokens stripped and the original chain dropped:
+    requests puts the full URL in its messages, and the roster read carries the
+    guild leader's token as ?auth=, which would otherwise reach both the mod
+    channel and the journal.
     """
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        None, functools.partial(requests.post, url, json=json, headers=headers)
+    try:
+        return await loop.run_in_executor(
+            None, functools.partial(method, url, timeout=HTTP_TIMEOUT, **kwargs)
+        )
+    except requests.RequestException as e:
+        raise FirebaseRequestError(
+            logic.redact_secrets(f"{type(e).__name__}: {e}"),
+            maybe_sent=not _never_connected(e),
+        ) from None
+
+
+def _never_connected(error):
+    """Whether a request failed before any connection opened, so it can't have
+    reached the server. Anything else -- a read timeout, a reset mid-response --
+    may have been acted on.
+
+    A DNS failure or refused connection arrives as requests.ConnectionError
+    wrapping urllib3's NewConnectionError; treating it as "maybe sent" would
+    record a phantom !invite that then blocks elimination for a week.
+    """
+    if isinstance(error, requests.ConnectTimeout):
+        return True
+    if isinstance(error, requests.ConnectionError) and error.args:
+        cause = error.args[0]
+        return isinstance(getattr(cause, 'reason', cause), urllib3.exceptions.NewConnectionError)
+    return False
+
+
+async def post_json(url, json=None, headers=None):
+    return await _request(requests.post, url, json=json, headers=headers)
+
+
+async def get_json(url, params=None):
+    return await _request(requests.get, url, params=params)
+
+
+SIGN_IN_URL = "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword"
+IGS_URL = "https://us-central1-idlemmo.cloudfunctions.net/igs"
+ROSTER_URL = "https://idlemmo.firebaseio.com/_guild/{gid}/m.json"
+SIGNIN_RETRY_SECONDS = 600
+
+# guild -> (id token, expiry in epoch seconds). Tokens last an hour, so the
+# invite poll signs in about once an hour rather than on every read.
+_firebase_tokens = {}
+# guild -> epoch seconds before which the invite poll must not sign in; forever
+# after a credentials failure, until a manual command signs in successfully.
+_poll_signin_paused_until = {}
+
+
+class FirebaseSignInError(Exception):
+    def __init__(self, message, permanent):
+        super().__init__(message)
+        self.permanent = permanent
+
+
+async def firebase_sign_in(IOguild, from_poll=False, force=False):
+    """(gid, id token) for a guild's leader account, cached until near expiry.
+
+    The poll backs off after a failure so it can't lock the account that !kick
+    and the weekly export also sign into: ten minutes for a transient error, and
+    indefinitely for a credentials error, which retrying can never fix. Manual
+    commands always try, and a manual success lifts the pause.
+    """
+    now = epoch_now()
+    cached = _firebase_tokens.get(IOguild)
+    if cached and not force and logic.token_is_fresh(now, cached[1]):
+        return guilds_data[IOguild]["gid"], cached[0]
+    if from_poll and now < _poll_signin_paused_until.get(IOguild, 0):
+        raise FirebaseSignInError(
+            f"signing in to {IOguild} is paused after an earlier failure", permanent=False
+        )
+
+    response = await post_json(
+        f"{SIGN_IN_URL}?key={os.environ.get('FIRE_API')}",
+        json={
+            "email": guilds_data[IOguild]["email"],
+            "password": os.environ.get('PASSWORD'),
+            "returnSecureToken": True,
+        },
     )
+    try:
+        data = response.json()
+    except ValueError:
+        data = {}
+    token = data.get("idToken")
+    if token:
+        _firebase_tokens[IOguild] = (token, now + int(data.get("expiresIn", 3600)))
+        _poll_signin_paused_until.pop(IOguild, None)
+        return guilds_data[IOguild]["gid"], token
 
-
-IDENTITY_TOOLKIT_URL = (
-    "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword"
-    "?key=AIzaSyAU62kOE6xhSrFqoXQPv6_WHxYilmoUxDk"
-)
+    message = (data.get("error") or {}).get("message") or f"HTTP {response.status_code}"
+    permanent = logic.classify_signin_error(message) == 'permanent'
+    if from_poll:
+        _poll_signin_paused_until[IOguild] = float('inf') if permanent else now + SIGNIN_RETRY_SECONDS
+    raise FirebaseSignInError(logic.redact_secrets(message), permanent=permanent)
 
 
 async def guild_login(ctx, IOguild):
-    """Resolve a guild name to its in-game id plus a fresh Firebase id token.
+    """Resolve a guild name to its in-game id plus a Firebase id token.
 
     Returns (gid, id_token), or (None, None) after replying with the reason.
-    Shared by invite and kick, which used to carry their own copy of this.
+    Shared by invite and kick.
     """
     if IOguild not in guilds_data:
         await ctx.send(f"'{IOguild}' is not one of our guilds. Use: {', '.join(guilds_data)}")
         return None, None
-
-    login = {
-        "email": guilds_data[IOguild]["email"],
-        "password": os.environ.get('PASSWORD'),
-        "returnSecureToken": True,
-    }
-    response = await post_json(IDENTITY_TOOLKIT_URL, json=login)
-    id_token = response.json().get("idToken", "")
-    if not id_token:
-        # Previously this fell through and sent "Bearer " with no token, so a
-        # credentials problem surfaced as an unrelated failure further on.
-        await ctx.send(f"Could not log in to {IOguild} in-game -- check the bot's credentials.")
+    try:
+        return await firebase_sign_in(IOguild)
+    except (FirebaseSignInError, FirebaseRequestError) as e:
+        # A failed login used to fall through and send "Bearer " with no token,
+        # so a credentials problem surfaced as an unrelated failure further on.
+        await ctx.send(f"Could not log in to {IOguild} in-game ({e}) -- check the bot's credentials.")
         return None, None
 
-    return guilds_data[IOguild]["gid"], id_token
+
+async def fetch_guild_roster(IOguild, from_poll=False):
+    """The live in-game roster, as logic.build_game_members_rows rows.
+
+    Plain REST with the cached token, off the event loop. Used by the weekly
+    export and !members_game as well as the invite poll, so there is one way to
+    read a roster and one sign-in path.
+    """
+    gid, token = await firebase_sign_in(IOguild, from_poll=from_poll)
+    url = ROSTER_URL.format(gid=gid)
+    response = await get_json(url, params={"auth": token})
+    if response.status_code == 401:
+        # A token can be revoked before it expires. One fresh sign-in, then stop.
+        gid, token = await firebase_sign_in(IOguild, from_poll=from_poll, force=True)
+        response = await get_json(url, params={"auth": token})
+    if response.status_code != 200:
+        raise FirebaseRequestError(
+            f"reading the {IOguild} roster failed: HTTP {response.status_code}", maybe_sent=False
+        )
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+    if not isinstance(payload, dict):
+        raise FirebaseRequestError(f"the {IOguild} roster came back empty", maybe_sent=False)
+    return logic.build_game_members_rows(payload)
 
 
 #command to send an invite
 @bot.command(name='invite')
 @commands.has_role("Moderator")
-async def invite(ctx, IOguild, InviteName):
+async def invite(ctx, IOguild: str = None, InviteName: str = None, *, member: str = None):
+    """Invite someone in game, then link, role and welcome them when they join.
 
+    The member is optional so the old `!invite <guild> <name>` still works; such
+    an invite is watched for, but a join is reported with a ready !assign rather
+    than linked, since there is no Discord account to link it to.
+    """
+    if IOguild is None or InviteName is None:
+        await ctx.send("Usage: !invite <guild> <in-game name> [@member]")
+        return
+    if IOguild not in logic.GUILD_NAMES:
+        await ctx.send(f"'{IOguild}' is not one of our guilds. Use: {', '.join(logic.GUILD_NAMES)}")
+        return
+
+    member_obj = None
+    target = None
+    if member:
+        try:
+            member_obj = await commands.MemberConverter().convert(ctx, member)
+        except commands.BadArgument:
+            await ctx.send(
+                f"Couldn't find '{member}' in this server. They need to be here to be "
+                f"linked -- or leave the member off to watch for the invite without linking."
+            )
+            return
+        target = {
+            'd_id': str(member_obj.id),
+            'display': member_obj.display_name,
+            'discord': member_obj.name + '#' + member_obj.discriminator,
+        }
+
+    # The baseline -- everyone already in the guild -- is read before the invite
+    # goes out. Read after, an instant accept would put the invitee in their own
+    # baseline, and they could never be matched.
+    try:
+        roster = await fetch_guild_roster(IOguild)
+    except (FirebaseRequestError, FirebaseSignInError) as e:
+        await ctx.send(
+            f"Couldn't read the {IOguild} roster ({e}), so the invite wasn't sent -- "
+            f"without it I can't tell who joins."
+        )
+        return
+    # Only now: the roster read replaces a token that turns out to be revoked,
+    # and the invite must go out with the current one.
     gid, id_token = await guild_login(ctx, IOguild)
     if gid is None:
         return
+    baseline_at = epoch_now()
+    baseline = {row['G_ID'] for row in roster}
+    if any(logic.name_key(row['G_NAME']) == logic.name_key(InviteName) for row in roster):
+        await ctx.send(f"'{InviteName}' is already in {IOguild}.")
+        return
 
-    # send invite
-    guildData = {
-        "data": {
-            "gid": gid,
-            "targetUsername": InviteName
-        }
-    }
-    headers = {
-        "Authorization": "Bearer " + id_token
-    }
-    response = await post_json("https://us-central1-idlemmo.cloudfunctions.net/igs", json=guildData, headers=headers)
-    
-    print(response.status_code)
-    print(response.content.decode())
-    
-    data = json.loads(response.content.decode())
-    result_value = data["result"]
-    
-    await ctx.send(logic.interpret_action_result(
-        result_value,
-        "Invite sent. Let a moderator know when you join",
-        "Error, invite not sent",
-    ))
-    
+    warnings = []
+    if target:
+        names = {row['G_ID']: row['G_NAME'] for row in roster}
+        already = sorted(
+            names[row['g_id']] for row in Functions.load_link_rows(IOguild)
+            if row['d_id'] == target['d_id'] and row['g_id'] in names
+        )
+        if already:
+            warnings.append(
+                f"Note: {member_obj.display_name} is already linked to {', '.join(already)} "
+                f"in {IOguild}, so this would be a second character."
+            )
+
+    send_confirmed = True
+    try:
+        response = await post_json(
+            IGS_URL,
+            json={"data": {"gid": gid, "targetUsername": InviteName}},
+            headers={"Authorization": "Bearer " + id_token},
+        )
+    except FirebaseRequestError as e:
+        if not e.maybe_sent:
+            await ctx.send(f"Couldn't reach the game, so the invite wasn't sent ({e}).")
+            return
+        # The request may well have reached the game even though no answer came
+        # back. Dropping it would lose a real invite: once they accept, running
+        # !invite again is refused as "already in the guild", so they'd never be
+        # linked. The baseline predates the POST, so watching anyway is safe --
+        # at worst it expires.
+        send_confirmed = False
+    else:
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = None
+        if not logic.action_succeeded(logic.parse_action_result(payload)):
+            await ctx.send(
+                f"The game refused the invite to '{InviteName}' -- check the in-game name, "
+                f"and that {IOguild} has a free slot."
+            )
+            return
+
+    record = Functions.record_invite(
+        IOguild, InviteName, target, baseline, baseline_at, epoch_now(), send_confirmed
+    )
+    member_has_role = member_obj is not None and any(role.name == IOguild for role in member_obj.roles)
+    await ctx.send(
+        logic.format_invite_ack(
+            IOguild, InviteName, member_obj.mention if member_obj else None,
+            record, send_confirmed, member_has_role, warnings,
+        ),
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@bot.command(name='invites')
+@commands.has_role("Moderator")
+async def invites(ctx):
+    """Invites being watched for, plus recent ones that need a look."""
+    now = epoch_now()
+    # Superseded ones are listed because they still block elimination for a
+    # week, and !uninvite is how they're cleared.
+    shown = Functions.load_invites(
+        statuses=logic.INVITE_OPEN_STATUSES + (
+            logic.INVITE_LINKED, logic.INVITE_NEEDS_ATTENTION, logic.INVITE_SUPERSEDED,
+        ),
+        since=now - logic.INVITE_MEMORY_SECONDS,
+    )
+    await ctx.send(logic.format_invites_list(shown, now), allowed_mentions=discord.AllowedMentions.none())
+
+
+@bot.command(name='uninvite')
+@commands.has_role("Moderator")
+async def uninvite(ctx, IOguild: str = None, *, name: str = None):
+    """Stop watching for an invite -- above all, to stop a welcome going to the
+    wrong person when the invite was tagged with the wrong member."""
+    if IOguild is None or name is None:
+        await ctx.send("Usage: !uninvite <guild> <in-game name>")
+        return
+    if IOguild not in logic.GUILD_NAMES:
+        await ctx.send(f"'{IOguild}' is not one of our guilds. Use: {', '.join(logic.GUILD_NAMES)}")
+        return
+    found = Functions.find_cancellable_invite(IOguild, name)
+    if found is None:
+        await ctx.send(f"No open invite to '{name}' in {IOguild}.")
+        return
+    Functions.set_invite_status(found['id'], logic.INVITE_CANCELLED)
+    await ctx.send(logic.format_uninvite(IOguild, found), allowed_mentions=discord.AllowedMentions.none())
+
 #command to kick from guild
 @bot.command(name='kick')
 @commands.has_role("Moderator")
@@ -447,10 +703,26 @@ async def kick(ctx, IOguild, KickID):
     headers = {
         "Authorization": "Bearer " + id_token
     }
-    response = await post_json("https://us-central1-idlemmo.cloudfunctions.net/gk", json=guildData, headers=headers)
-    
-    data = json.loads(response.content.decode())
-    result_value = data["result"]
+    kick_uncertain = False
+    try:
+        response = await post_json("https://us-central1-idlemmo.cloudfunctions.net/gk", json=guildData, headers=headers)
+    except FirebaseRequestError as e:
+        if not e.maybe_sent:
+            await ctx.send(f"Couldn't reach the game, so the kick wasn't sent ({e}).")
+            return
+        # No answer in time, but the kick may well have happened in game. Carry
+        # on to the role cleanup rather than leave a kicked member with every
+        # Discord role, and say plainly that the in-game result is unknown.
+        response = None
+        kick_uncertain = True
+
+    payload = None
+    if response is not None:
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = None
+    result_value = logic.parse_action_result(payload)
     c.execute(f"SELECT G_NAME FROM {table_name_members} WHERE D_ID = ?", (KickID,))
     Disp_result = c.fetchall()
     Disp_result = Disp_result[0][0]
@@ -489,6 +761,11 @@ async def kick(ctx, IOguild, KickID):
         f"{Disp_result} has been kicked from {IOguild}",
         "Error, not kicked",
     )
+    if kick_uncertain:
+        message = (
+            f"The game didn't answer in time, so {Disp_result} may or may not have been "
+            f"kicked from {IOguild} -- check in game. Their Discord roles were updated as for a kick."
+        )
     if role_warning:
         message += " (Discord roles were not updated: " + role_warning + ")"
     await ctx.send(message)
@@ -690,6 +967,17 @@ async def baba_ping():
 
 #does weekly GP things
 async def run_weekly_gp(ack_channel):
+    """Run the weekly cycle with the invite poll held off {guild}_game.
+
+    Wraps the whole cycle, not just the reporting part: the window that matters
+    is between members_guild's export and GP_databases reading it, which sits
+    before the cycle's own try block.
+    """
+    with Functions.weekly_job():
+        await _run_weekly_gp(ack_channel)
+
+
+async def _run_weekly_gp(ack_channel):
     """One weekly GP cycle: refresh in-game GP, roll this week's snapshot
     columns, reassign rank roles, report low-GP members, and back up the DB.
 
@@ -731,7 +1019,7 @@ async def run_weekly_gp(ack_channel):
         # week's columns. A cycle that failed partway is exactly when a
         # snapshot matters most, so the backup must not be skipped with it.
         # No conn.commit() here: this module's connection performs no writes
-        # during the cycle. Each writer commits its own -- Functions.GP_export
+        # during the cycle. Each writer commits its own -- write_game_roster
         # commits Functions.conn, and GP_databases commits the connection it
         # opens itself.
         print("weekly GP calculated")
@@ -803,6 +1091,245 @@ async def gp_weekly_loop():
         except Exception as send_error:
             print(f"could not report weekly GP failure: {send_error}", file=sys.stderr)
 
+##---------------------------------------------  Invite auto-link
+
+# In memory on purpose: lost on restart, these only cost one early poll and one
+# repeated connectivity note. Everything that must survive a restart -- the
+# invites themselves, and which arrivals were already reported -- is in the DB.
+_invite_last_polled = {}
+_invite_poll_failing = {}
+
+
+async def report_to_mods(text):
+    if LedukasSpam_channel is None:
+        print(f"(mod channel unavailable) {text}", file=sys.stderr)
+        return
+    await LedukasSpam_channel.send(text, allowed_mentions=discord.AllowedMentions.none())
+
+
+@tasks.loop(seconds=10)
+async def invite_poll_loop():
+    # tasks.loop stops for good after an unhandled exception, and the only sign
+    # would be invites that quietly never complete.
+    try:
+        await invite_poll_tick()
+    except Exception as e:
+        print(f"invite poll tick failed: {logic.redact_secrets(e)}", file=sys.stderr)
+        traceback.print_exception(type(e), e, e.__traceback__)
+
+
+@invite_poll_loop.before_loop
+async def _invite_poll_wait_until_ready():
+    await bot.wait_until_ready()
+
+
+async def invite_poll_tick():
+    if Functions.weekly_job_depth > 0:
+        return
+    now = epoch_now()
+
+    for pending in Functions.load_invites(statuses=(logic.INVITE_PENDING,)):
+        if logic.invite_age(now, pending['sent_at']) >= logic.INVITE_TRACK_SECONDS:
+            Functions.set_invite_status(pending['id'], logic.INVITE_EXPIRED)
+            await report_to_mods(logic.format_invite_expired(pending['guild'], pending))
+
+    # Anything left `linked` was interrupted between writing the link and
+    # finishing; this is what resumes it after a crash or restart.
+    for linked in Functions.load_invites(statuses=(logic.INVITE_LINKED,)):
+        await finish_invite(linked)
+
+    pending = Functions.load_invites(statuses=(logic.INVITE_PENDING,))
+    for IOguild in logic.GUILD_NAMES:
+        guild_pending = [inv for inv in pending if inv['guild'] == IOguild]
+        if not guild_pending:
+            continue
+        newest = max(inv['sent_at'] for inv in guild_pending)
+        if not logic.should_poll_guild(now, newest, _invite_last_polled.get(IOguild)):
+            continue
+        _invite_last_polled[IOguild] = now
+        # Isolated per guild, and reported on the first failure and on recovery
+        # rather than every ten seconds.
+        try:
+            await poll_guild_invites(IOguild)
+        except Exception as e:
+            detail = logic.redact_secrets(e)
+            print(f"invite poll for {IOguild} failed: {detail}", file=sys.stderr)
+            if not _invite_poll_failing.get(IOguild):
+                _invite_poll_failing[IOguild] = True
+                if isinstance(e, FirebaseSignInError) and e.permanent:
+                    note = ("The login was rejected, so I've stopped retrying -- any command "
+                            "that logs in (e.g. !invite) will resume it once the password is fixed.")
+                else:
+                    note = "I'll keep trying and say when it works again."
+                await report_to_mods(f"Can't read the {IOguild} roster to watch for invites: {detail}. {note}")
+        else:
+            if _invite_poll_failing.pop(IOguild, False):
+                await report_to_mods(f"Reading the {IOguild} roster works again.")
+
+
+async def poll_guild_invites(IOguild):
+    """Read one guild's roster and settle whatever invites it resolves."""
+    now = epoch_now()
+    # Read before the roster: an invite recorded while the read is in flight
+    # would have a baseline newer than the data, making earlier members look
+    # like arrivals.
+    invites = Functions.load_invites(
+        IOguild, statuses=logic.INVITE_MATCHABLE_STATUSES, since=now - logic.INVITE_MEMORY_SECONDS
+    )
+    generation = Functions.roster_generation
+    rows = await fetch_guild_roster(IOguild, from_poll=True)
+    fetched_at = epoch_now()
+    if Functions.weekly_job_depth > 0:
+        return
+    roster = {row['G_ID']: row['G_NAME'] for row in rows}
+
+    result = logic.match_invites(
+        invites, roster, Functions.load_link_rows(IOguild), Functions.invite_claims(IOguild), fetched_at
+    )
+    for action in result['actions']:
+        await apply_invite_action(IOguild, action)
+
+    already = Functions.reported_arrivals(IOguild, since=fetched_at - logic.INVITE_MEMORY_SECONDS)
+    for arrival in result['unmatched']:
+        if arrival['g_id'] in already:
+            continue
+        # Marked first: if the send fails, a missing report beats one that
+        # repeats every ten seconds.
+        Functions.mark_arrival_reported(IOguild, arrival['g_id'], fetched_at)
+        await report_to_mods(logic.format_unmatched_arrival(IOguild, arrival))
+
+    outcome = Functions.refresh_game_roster(IOguild, rows, generation)
+    if outcome.startswith('refused'):
+        print(f"{IOguild}_game not refreshed -- {outcome}", file=sys.stderr)
+
+
+async def apply_invite_action(IOguild, action):
+    invite = action['invite']
+    # A !uninvite or a re-invite may have landed while the roster was being read.
+    current = Functions.get_invite(invite['id'])
+    if current is None or any(current[key] != invite[key] for key in ('status', 'sent_at', 'd_id')):
+        return
+
+    g_id, character = action['g_id'], action['name']
+    matched = {
+        'matched_g_id': g_id, 'matched_name': character,
+        'matched_at': epoch_now(), 'method': action['method'],
+    }
+    kind = action['kind']
+    if kind == logic.ACTION_LINK:
+        decision, others = Functions.link_for_invite(IOguild, g_id, character, current)
+        if decision == 'conflict':
+            Functions.set_invite_status(invite['id'], logic.INVITE_CONFLICT, **matched)
+            await report_to_mods(logic.format_invite_conflict(IOguild, current, character, g_id, others))
+            return
+        Functions.set_invite_status(invite['id'], logic.INVITE_LINKED, **matched)
+        await finish_invite(Functions.get_invite(invite['id']))
+    elif kind == logic.ACTION_CONFLICT:
+        Functions.set_invite_status(invite['id'], logic.INVITE_CONFLICT, **matched)
+        await report_to_mods(
+            logic.format_invite_conflict(IOguild, current, character, g_id, action['other_accounts'])
+        )
+    elif kind == logic.ACTION_REPORT_SUPERSEDED:
+        Functions.set_invite_status(invite['id'], logic.INVITE_REPORTED, **matched)
+        await report_to_mods(logic.format_invite_superseded(IOguild, current, character, g_id))
+    elif kind == logic.ACTION_REPORT_CANCELLED:
+        Functions.set_invite_status(invite['id'], logic.INVITE_REPORTED, **matched)
+        await report_to_mods(logic.format_invite_cancelled_arrival(IOguild, current, character, g_id))
+    elif kind == logic.ACTION_REPORT_NO_MEMBER:
+        Functions.set_invite_status(invite['id'], logic.INVITE_REPORTED, **matched)
+        await report_to_mods(logic.format_invite_unlinkable(IOguild, current, character, g_id))
+
+
+async def _invite_needs_attention(invite, character, reason):
+    Functions.set_invite_status(invite['id'], logic.INVITE_NEEDS_ATTENTION)
+    await report_to_mods(logic.format_invite_needs_attention(invite['guild'], invite, character, reason))
+
+
+async def finish_invite(invite):
+    """Give a linked member their role and the welcome, then mark the invite done.
+
+    Re-run on every tick for any invite still `linked`, so a crash anywhere in
+    here resumes. That retry is for crashes only: a Discord error that would
+    simply happen again (Forbidden because the bot's role sits below the guild
+    role, say) moves the invite to needs_attention after one report, instead of
+    failing and reporting every ten seconds forever.
+
+    The welcome is sent only when this call added the guild role. That makes it
+    at-most-once across crashes -- a double public welcome is worse than a
+    missed one -- and stops a second welcome when a mod already did it by hand.
+    """
+    IOguild = invite['guild']
+    character = invite.get('matched_name')
+    discord_guild = bot.get_guild(809954021028134943)
+    if discord_guild is None:
+        return
+    d_id = int(invite['d_id'])
+
+    member = discord_guild.get_member(d_id)
+    if member is None:
+        # The member cache is cold right after a restart, so ask Discord directly.
+        try:
+            member = await discord_guild.fetch_member(d_id)
+        except discord.NotFound:
+            print(f"WARNING: {IOguild}: linked {character} to {d_id}, who is not in the server",
+                  file=sys.stderr)
+            Functions.set_invite_status(invite['id'], logic.INVITE_DONE)
+            await report_to_mods(logic.format_invite_member_gone(IOguild, invite, character))
+            return
+        except discord.HTTPException as e:
+            await _invite_needs_attention(invite, character, f"couldn't look the member up ({e})")
+            return
+
+    role = discord.utils.get(discord_guild.roles, name=IOguild)
+    if role is None:
+        await _invite_needs_attention(invite, character, f"there is no '{IOguild}' role")
+        return
+    role_added = former_removed = False
+    try:
+        if role not in member.roles:
+            await member.add_roles(role, reason=f"Joined {IOguild} via !invite")
+            role_added = True
+        former = discord.utils.get(discord_guild.roles, name=FORMER_ROLE_NAME)
+        if former is not None and former in member.roles:
+            await member.remove_roles(former, reason=f"Rejoined {IOguild}")
+            former_removed = True
+    except discord.HTTPException as e:
+        await _invite_needs_attention(invite, character, f"couldn't change their roles ({e})")
+        return
+
+    welcome_note = None
+    if role_added:
+        # The welcome is the one public step, so re-check for an !uninvite that
+        # landed while the roles were being changed.
+        latest = Functions.get_invite(invite['id'])
+        if latest is None or latest['status'] != logic.INVITE_LINKED:
+            await report_to_mods(logic.format_invite_cancelled_midway(IOguild, invite, character))
+            return
+        welcome_note = await post_welcome(IOguild, member)
+    Functions.set_invite_status(invite['id'], logic.INVITE_DONE)
+    await report_to_mods(logic.format_invite_linked(
+        IOguild, invite, character, invite['matched_g_id'], invite['method'],
+        role_added, former_removed, welcome_note,
+    ))
+
+
+async def post_welcome(IOguild, member):
+    """Post the welcome; returns None on success, or a note for the mod report."""
+    if None in (WELCOME_POST_CHANNEL_ID, WELCOME_INFO_CHANNEL_ID, ROLES_CHANNEL_ID):
+        return ("No welcome posted: WELCOME_POST_CHANNEL_ID, WELCOME_INFO_CHANNEL_ID and "
+                "ROLES_CHANNEL_ID all need setting in .env.")
+    channel = bot.get_channel(WELCOME_POST_CHANNEL_ID)
+    if channel is None:
+        return f"No welcome posted: channel {WELCOME_POST_CHANNEL_ID} wasn't found."
+    try:
+        await channel.send(
+            logic.format_welcome(IOguild, member.id, WELCOME_INFO_CHANNEL_ID, ROLES_CHANNEL_ID),
+            allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=[member]),
+        )
+    except discord.HTTPException as e:
+        return f"The welcome couldn't be posted ({e})."
+    return None
+
 ##---------------------------------------------  Errors
 # error messages for all commands
 @assign.error
@@ -846,7 +1373,12 @@ async def on_ready():
     # runs its body immediately on start().
     if not gp_weekly_loop.is_running():
         gp_weekly_loop.start()
-    
+    if not invite_poll_loop.is_running():
+        invite_poll_loop.start()
+    if None in (WELCOME_POST_CHANNEL_ID, WELCOME_INFO_CHANNEL_ID, ROLES_CHANNEL_ID):
+        print("WARNING: welcome channel ids are not all set in .env; invite auto-link "
+              "will link and give roles but skip the welcome", file=sys.stderr)
+
     await load_cogs()
 
 if __name__ == "__main__":

@@ -14,18 +14,6 @@ import pytest
 import Functions
 
 
-@pytest.fixture
-def temp_functions_db(tmp_path, monkeypatch):
-    """Point Functions' module-level connection at a throwaway database so
-    these tests never touch the real DatabaseLedBot.db."""
-    db_path = tmp_path / "marker.db"
-    conn = sqlite3.connect(str(db_path))
-    monkeypatch.setattr(Functions, "conn", conn)
-    monkeypatch.setattr(Functions, "c", conn.cursor())
-    yield db_path
-    conn.close()
-
-
 RUN_KEY = "GP2026_09_12"
 
 

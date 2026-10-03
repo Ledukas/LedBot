@@ -1,6 +1,11 @@
 [Unit]
 Description=LedBot Discord bot
-After=network-online.target
+# time-sync.target: the Pi has no clock battery, so until NTP syncs the clock
+# can be hours out. Invites are timed in wall-clock seconds and the weekly job
+# keys on the local date, so the bot must not start on a wrong clock. Ordering
+# only (not Wants=, per systemd.special(7)); it has no effect unless
+# systemd-time-wait-sync is enabled -- see DEPLOY.md.
+After=network-online.target time-sync.target
 Wants=network-online.target
 
 [Service]

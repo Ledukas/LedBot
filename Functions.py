@@ -6,7 +6,6 @@ import discord
 import os
 import re
 from dotenv import load_dotenv
-import pyrebase
 import aiohttp
 import json
 import time
@@ -14,6 +13,7 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from google.oauth2.service_account import Credentials
 import asyncio
+from contextlib import contextmanager
 
 import logic
 from scripts.backup_db import run_backup
@@ -30,7 +30,6 @@ load_dotenv()
 conn = sqlite3.connect('DatabaseLedBot.db')
 conn.execute("PRAGMA journal_mode=WAL")
 c = conn.cursor()
-password = os.environ.get('PASSWORD')
 
 GP_prefix = 'GP'
 separator = ' | '
@@ -144,6 +143,34 @@ async def mark_weekly_run_started(run_key: str) -> None:
         (run_key, datetime.now().isoformat(timespec='seconds')),
     )
     conn.commit()
+
+
+# How many weekly jobs are running (a counter, not a flag: a moderator's
+# !GP_weekly can overlap the scheduled run, and a flag would be cleared by
+# whichever finished first while the other was still between its export and
+# GP_databases). roster_generation is bumped whenever {guild}_game is written by
+# anything other than the invite poll, so a poll whose roster read was already
+# in flight can tell a fresher roster landed meanwhile and must not replace it.
+weekly_job_depth = 0
+roster_generation = 0
+
+
+@contextmanager
+def weekly_job():
+    """Mark the weekly cycle as running while the body executes.
+
+    The invite poll refreshes {guild}_game mid-week. The weekly job exports
+    {guild}_game and then GP_databases reads it, with an await in between
+    (members_guild's ctx.send), so a poll write landing there would have this
+    week's GP computed against a different roster from the one just exported.
+    """
+    global weekly_job_depth, roster_generation
+    weekly_job_depth += 1
+    roster_generation += 1
+    try:
+        yield
+    finally:
+        weekly_job_depth -= 1
 
 
 #get the dataframe
@@ -409,12 +436,13 @@ async def conflicts(channel, IOguild, announce_clean=False):
     try:
         links, live_characters, _ = _load_link_snapshot(IOguild)
         character_conflicts, account_conflicts = logic.find_link_conflicts(links, live_characters)
+        unlinked = logic.unlinked_characters(links, live_characters)
     except Exception as e:
         print("line: " + str(inspect.currentframe().f_lineno) + "\n error: " + str(e))
         await channel.send(f"Error building the link-conflict report for {IOguild}: {e}")
         return
 
-    message = logic.format_conflicts(IOguild, character_conflicts, account_conflicts)
+    message = logic.format_conflicts(IOguild, character_conflicts, account_conflicts, unlinked)
     if message is None:
         if announce_clean:
             await channel.send(f"{IOguild}: no link conflicts found.")
@@ -616,7 +644,7 @@ def _relink_write(IOguild, g_id, current_name, target):
     """Repoint one character's link rows. Synchronous, and must stay that way.
 
     Functions.conn is a single connection shared by every coroutine, and
-    GP_export, GP_databases and mark_weekly_run_started all commit on it. An
+    write_game_roster, GP_databases and mark_weekly_run_started all commit on it. An
     await anywhere between the SELECT and the commit would let one of them
     commit this function's half-finished delete, so the whole transaction runs
     without yielding and the message is built by the caller afterwards.
@@ -773,6 +801,242 @@ async def relink(channel, IOguild, g_id, target):
     ))
 
 
+INVITES_TABLE = 'invites'
+INVITE_REPORTS_TABLE = 'invite_arrival_reports'
+
+INVITE_COLUMNS = (
+    'id', 'guild', 'invited_name', 'name_key', 'd_id', 'display', 'discord',
+    'first_sent_at', 'sent_at', 'baseline', 'baseline_at', 'status', 'send_confirmed',
+    'matched_g_id', 'matched_name', 'matched_at', 'method', 'superseded_by',
+)
+
+
+# The connection the invite tables were last ensured on. Keyed on the
+# connection rather than a plain flag so a fresh database (tests swap one in
+# per test) still gets its tables, while the live bot runs the DDL once.
+_invite_tables_ready_on = None
+
+
+def _ensure_invite_tables():
+    """Invites are kept, never deleted: a finished one is the record that stops
+    its matched character being handed to another invite."""
+    global _invite_tables_ready_on
+    if _invite_tables_ready_on is conn:
+        return
+    c.execute(
+        f"CREATE TABLE IF NOT EXISTS {INVITES_TABLE} ("
+        "id INTEGER PRIMARY KEY, guild TEXT NOT NULL, invited_name TEXT NOT NULL, "
+        "name_key TEXT NOT NULL, d_id TEXT, display TEXT, discord TEXT, "
+        "first_sent_at REAL NOT NULL, sent_at REAL NOT NULL, "
+        "baseline TEXT NOT NULL, baseline_at REAL NOT NULL, "
+        "status TEXT NOT NULL, send_confirmed INTEGER NOT NULL DEFAULT 1, "
+        "matched_g_id TEXT, matched_name TEXT, matched_at REAL, method TEXT, "
+        "superseded_by INTEGER)"
+    )
+    c.execute(
+        f"CREATE TABLE IF NOT EXISTS {INVITE_REPORTS_TABLE} "
+        "(guild TEXT NOT NULL, g_id TEXT NOT NULL, reported_at REAL NOT NULL, "
+        "PRIMARY KEY (guild, g_id))"
+    )
+    conn.commit()
+    _invite_tables_ready_on = conn
+
+
+def _invite_from_row(row):
+    invite = dict(zip(INVITE_COLUMNS, row))
+    invite['baseline'] = set(json.loads(invite['baseline']))
+    return invite
+
+
+def load_invites(IOguild=None, statuses=None, since=None):
+    _ensure_invite_tables()
+    clauses, params = [], []
+    if IOguild is not None:
+        clauses.append("guild = ?")
+        params.append(IOguild)
+    if statuses:
+        clauses.append(f"status IN ({', '.join('?' for _ in statuses)})")
+        params.extend(statuses)
+    if since is not None:
+        clauses.append("sent_at >= ?")
+        params.append(since)
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    rows = c.execute(
+        f"SELECT {', '.join(INVITE_COLUMNS)} FROM {INVITES_TABLE}{where} ORDER BY sent_at, id",
+        params,
+    ).fetchall()
+    return [_invite_from_row(row) for row in rows]
+
+
+def get_invite(invite_id):
+    _ensure_invite_tables()
+    row = c.execute(
+        f"SELECT {', '.join(INVITE_COLUMNS)} FROM {INVITES_TABLE} WHERE id = ?", (invite_id,)
+    ).fetchone()
+    return _invite_from_row(row) if row else None
+
+
+def find_cancellable_invite(IOguild, name):
+    """The newest invite !uninvite can act on for this name, or None.
+
+    Includes superseded invites: they block elimination for a week, so a
+    moderator needs a way to clear one whose stray recipient isn't coming.
+    """
+    statuses = logic.INVITE_OPEN_STATUSES + (
+        logic.INVITE_LINKED, logic.INVITE_NEEDS_ATTENTION, logic.INVITE_SUPERSEDED,
+    )
+    candidates = [
+        invite for invite in load_invites(IOguild, statuses=statuses)
+        if invite['name_key'] == logic.name_key(name)
+    ]
+    return candidates[-1] if candidates else None
+
+
+def record_invite(IOguild, name, target, baseline, baseline_at, now, send_confirmed):
+    """Record a sent !invite, merging or superseding per logic.plan_invite_record.
+
+    `target` is {'d_id', 'display', 'discord'} or None when no member was
+    given. Synchronous and committed as one unit, so an !invite can never leave
+    a new row in place alongside the invite it was meant to replace.
+    """
+    _ensure_invite_tables()
+    target = target or {}
+    d_id = logic.normalize_discord_id(target.get('d_id'))
+    plan = logic.plan_invite_record(
+        load_invites(IOguild, statuses=logic.INVITE_OPEN_STATUSES), name, d_id, baseline
+    )
+    baseline_json = json.dumps(sorted(plan['baseline']))
+    first_sent_at = plan['first_sent_at'] if plan['first_sent_at'] is not None else now
+    merge = plan['merge_into']
+    try:
+        if merge:
+            c.execute(
+                f"UPDATE {INVITES_TABLE} SET invited_name = ?, d_id = ?, display = ?, discord = ?, "
+                "sent_at = ?, first_sent_at = ?, baseline = ?, baseline_at = ?, status = ?, "
+                "send_confirmed = ? WHERE id = ?",
+                (name, d_id, target.get('display'), target.get('discord'), now, first_sent_at,
+                 baseline_json, baseline_at, logic.INVITE_PENDING, int(send_confirmed), merge['id']),
+            )
+            invite_id, outcome = merge['id'], 'merged'
+        else:
+            c.execute(
+                f"INSERT INTO {INVITES_TABLE} (guild, invited_name, name_key, d_id, display, "
+                "discord, first_sent_at, sent_at, baseline, baseline_at, status, send_confirmed) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (IOguild, name, logic.name_key(name), d_id, target.get('display'),
+                 target.get('discord'), first_sent_at, now, baseline_json, baseline_at,
+                 logic.INVITE_PENDING, int(send_confirmed)),
+            )
+            invite_id, outcome = c.lastrowid, 'new'
+        for old in plan['supersede']:
+            c.execute(
+                f"UPDATE {INVITES_TABLE} SET status = ?, superseded_by = ? WHERE id = ?",
+                (logic.INVITE_SUPERSEDED, invite_id, old['id']),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return {
+        'outcome': outcome,
+        'invite_id': invite_id,
+        'd_id': d_id,
+        'previous_d_id': logic.normalize_discord_id(merge.get('d_id')) if merge else None,
+        'superseded': [old['invited_name'] for old in plan['supersede']],
+    }
+
+
+def set_invite_status(invite_id, status, **fields):
+    """Move an invite to `status`, optionally recording what it matched."""
+    allowed = {'matched_g_id', 'matched_name', 'matched_at', 'method'}
+    unknown = set(fields) - allowed
+    if unknown:
+        raise ValueError(f"Unknown invite fields: {sorted(unknown)}")
+    assignments = ", ".join(["status = ?"] + [f"{name} = ?" for name in fields])
+    c.execute(
+        f"UPDATE {INVITES_TABLE} SET {assignments} WHERE id = ?",
+        (status, *fields.values(), invite_id),
+    )
+    conn.commit()
+
+
+def invite_claims(IOguild):
+    """{g_id: when an invite last matched it} for this guild."""
+    _ensure_invite_tables()
+    return {
+        g_id: matched_at
+        for g_id, matched_at in c.execute(
+            f"SELECT matched_g_id, MAX(matched_at) FROM {INVITES_TABLE} "
+            "WHERE guild = ? AND matched_g_id IS NOT NULL GROUP BY matched_g_id",
+            (IOguild,),
+        ).fetchall()
+    }
+
+
+def reported_arrivals(IOguild, since):
+    """Arrivals already reported as unmatched since `since`.
+
+    Persisted because the poll re-evaluates every tick: kept in memory, every
+    restart would re-post every unmatched arrival still inside the window.
+    """
+    _ensure_invite_tables()
+    return {
+        row[0] for row in c.execute(
+            f"SELECT g_id FROM {INVITE_REPORTS_TABLE} WHERE guild = ? AND reported_at >= ?",
+            (IOguild, since),
+        ).fetchall()
+    }
+
+
+def mark_arrival_reported(IOguild, g_id, now):
+    c.execute(
+        f"INSERT OR REPLACE INTO {INVITE_REPORTS_TABLE} (guild, g_id, reported_at) VALUES (?, ?, ?)",
+        (IOguild, g_id, now),
+    )
+    conn.commit()
+
+
+def load_link_rows(IOguild):
+    table = logic.table_name(IOguild, 'members')
+    return [
+        {
+            'rowid': rowid,
+            'd_id': logic.normalize_discord_id(d_id),
+            'g_id': logic.normalize_game_id(g_id),
+        }
+        for rowid, d_id, g_id in c.execute(f"SELECT rowid, D_ID, G_ID FROM {table}").fetchall()
+    ]
+
+
+def link_for_invite(IOguild, g_id, current_name, target):
+    """Link g_id to target's account for an invite, never deleting a row.
+
+    Returns logic.plan_invite_link's (decision, other_accounts). Only an insert
+    writes anything; a conflict leaves the table alone for a moderator's
+    !relink. Synchronous for the reason on _relink_write: the read and the
+    write must not have an await between them on the shared connection.
+    """
+    table = logic.table_name(IOguild, 'members')
+    rows = [
+        {'rowid': rowid, 'd_id': d_id}
+        for rowid, d_id in c.execute(
+            f"SELECT rowid, D_ID FROM {table} WHERE G_ID = ?", (g_id,)
+        ).fetchall()
+    ]
+    decision, others = logic.plan_invite_link(rows, target['d_id'])
+    if decision == 'insert':
+        try:
+            c.execute(
+                f"INSERT INTO {table} (Discord, D_ID, Display, G_ID, G_NAME) VALUES (?,?,?,?,?)",
+                (target.get('discord'), int(target['d_id']), target.get('display'), g_id, current_name),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    return decision, others
+
+
 async def promotions(bot, channel):
     try:
         with open('promo.txt', 'w') as file:
@@ -815,49 +1079,71 @@ async def promotions(bot, channel):
 
 
     
-async def GP_export(email_a, email_p):
+def _ensure_game_table(table):
+    """Create {guild}_game with the schema pandas' to_sql originally gave it.
 
-    emails = {"Aetherians": email_a, "Pretherians": email_p}
-    guilds_data = {
-        name: {"gid": gid, "email": emails[name]}
-        for name, gid in logic.GUILD_GIDS.items()
-    }
+    The shape matters beyond tidiness: assign and sync_counters read this table
+    with SELECT * and index the columns by position.
+    """
+    c.execute(
+        f'CREATE TABLE IF NOT EXISTS "{table}" '
+        '("index" INTEGER, "G_NAME" TEXT, "G_ID" TEXT, "GP" INTEGER)'
+    )
+    c.execute(f'CREATE INDEX IF NOT EXISTS "ix_{table}_index" ON "{table}" ("index")')
 
-    ## Configure Firebase
-    config = {
-        "apiKey": os.environ.get('FIRE_API'),
-        "authDomain": "idlemmo.firebaseapp.com",
-        "databaseURL": "https://idlemmo.firebaseio.com",
-        "storageBucket": "idlemmo.appspot.com"
-    }
-    # Initialize Firebase
-    firebase = pyrebase.initialize_app(config)
-    # Get the authentication instance
-    auth = firebase.auth()
 
-    #export members from the game
-    for guild_name, guild_attributes in guilds_data.items():  
-        # Sign in with email and password
-        user = auth.sign_in_with_email_and_password(guild_attributes["email"], password)
-        # Get the ID token
-        id_token = user['idToken']
+def write_game_roster(IOguild, rows, from_poll=False):
+    """Replace {guild}_game with `rows` in a single transaction.
 
-        # Create a custom Firebase client with the ID token
-        custom_app = pyrebase.initialize_app(config)
-        db = custom_app.database()
-        # Create an observable on the specified database location
-        ref = db.child("_guild").child(guild_attributes["gid"]).child("m")
-        # Stream changes and register the stream handler
-        data = ref.get(token=id_token).val()
+    This used to be pd.DataFrame(rows).to_sql(..., if_exists='replace'), which
+    issues DROP, CREATE and CREATE INDEX as separately autocommitted statements
+    and only then inserts inside a transaction -- so a power cut between them
+    leaves the table empty or missing. That was a once-a-week exposure; with the
+    invite poll refreshing the roster mid-week it would be one on every change.
+    DELETE and INSERT here commit together or not at all.
+    """
+    global roster_generation
+    table = logic.table_name(IOguild, 'game')
+    _ensure_game_table(table)
+    try:
+        c.execute(f'DELETE FROM "{table}"')
+        c.executemany(
+            f'INSERT INTO "{table}" ("index", "G_NAME", "G_ID", "GP") VALUES (?, ?, ?, ?)',
+            [(position, row['G_NAME'], row['G_ID'], row['GP']) for position, row in enumerate(rows)],
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    if not from_poll:
+        roster_generation += 1
 
-        rows = logic.build_game_members_rows(data)
-        df_members_game = pd.DataFrame(rows)
 
-        ## add member list to the database
-        df_members_game.to_sql(logic.table_name(guild_name, 'game'), conn, if_exists='replace')
-        
-    conn.commit()
-    
+def refresh_game_roster(IOguild, rows, generation):
+    """Write a roster the invite poll just read, if it's safe and it changed.
+
+    Returns what happened, for logging. Synchronous from the checks through
+    the commit: nothing may await in here, or the weekly job could start
+    between the check and the write. Keep it off executors for the same reason.
+    """
+    if weekly_job_depth > 0:
+        return 'skipped: the weekly job is running'
+    if generation != roster_generation:
+        return 'skipped: a newer roster was written while this one was being read'
+    table = logic.table_name(IOguild, 'game')
+    try:
+        current = c.execute(f'SELECT G_ID, G_NAME FROM "{table}"').fetchall()
+    except sqlite3.OperationalError:
+        current = []
+    reason = logic.validate_roster_rows(rows, len(current))
+    if reason:
+        return f'refused: {reason}'
+    if not logic.roster_changed(rows, current):
+        return 'unchanged'
+    write_game_roster(IOguild, rows, from_poll=True)
+    return 'written'
+
+
 async def GP_databases():
     conn = sqlite3.connect('DatabaseLedBot.db')
     conn.execute("PRAGMA journal_mode=WAL")

@@ -589,22 +589,45 @@ CONFLICT_REPORT_BUDGET = 1500
 
 
 def _fit_entries(entries: list[list[str]], budget: int) -> tuple[list[str], int]:
-    """As many whole entries as fit, plus how many were left out."""
+    """As many whole entries as fit, plus how many were left out.
+
+    A positive budget always admits the first entry even if it alone is over,
+    so a report is never reduced to an empty block. A budget already spent
+    admits nothing: with three sections sharing one allowance, forcing an entry
+    into each would push the message past Discord's limit.
+    """
     lines: list[str] = []
     used = 0
     for index, entry in enumerate(entries):
         size = sum(len(line) + 1 for line in entry)
-        if used + size > budget and lines:
+        if used + size > budget and (lines or budget <= 0):
             return lines, len(entries) - index
         lines.extend(entry)
         used += size
     return lines, 0
 
 
+def unlinked_characters(link_rows: list[dict], live_characters: dict) -> list[tuple]:
+    """(name, g_id) for every in-game character with no usable link row.
+
+    These are the members who joined and were never assigned -- the gap the
+    invite auto-link exists to close, and the backstop for anyone who accepts
+    an invite after the bot has stopped watching for it. A row with a game id
+    but no usable Discord id still counts as unlinked: nobody is attached to it.
+    """
+    linked = {row['g_id'] for row in usable_links(link_rows)}
+    return sorted(
+        (character_name(entry) or g_id, g_id)
+        for g_id, entry in live_characters.items()
+        if g_id not in linked
+    )
+
+
 def format_conflicts(
     io_guild: str,
     character_conflicts: list[dict],
     account_conflicts: list[dict],
+    unlinked: list[tuple] = (),
     budget: int = CONFLICT_REPORT_BUDGET,
 ) -> str | None:
     """One guild's conflict report, or None when there is nothing to report.
@@ -617,7 +640,7 @@ def format_conflicts(
     Entries are sorted worst-first, so when the budget truncates the report it
     is always the least urgent ones that fall off the end.
     """
-    if not character_conflicts and not account_conflicts:
+    if not character_conflicts and not account_conflicts and not unlinked:
         return None
 
     lines = [f"**{io_guild} -- link conflicts**"]
@@ -655,16 +678,37 @@ def format_conflicts(
             [f"{conflict['d_id']}  --  {', '.join(conflict['characters'])}"]
             for conflict in account_conflicts
         ]
-        body, omitted = _fit_entries(entries, max(remaining, 0))
-        lines.append(
+        remaining = _append_section(
+            lines, entries, remaining, "account(s)",
             "One account on several live characters (may be a legitimate alt, "
-            "but !mygains and !kick will pick one arbitrarily):"
+            "but !mygains and !kick will pick one arbitrarily):",
         )
-        lines.append("```\n" + "\n".join(body) + "\n```")
-        if omitted:
-            lines.append(f"...and {omitted} more account(s).")
+
+    if unlinked:
+        entries = [[f"{name}  ({g_id})"] for name, g_id in unlinked]
+        _append_section(
+            lines, entries, remaining, "character(s)",
+            "In game with no Discord account linked (!assign them, or check with !whois):",
+        )
 
     return "\n".join(lines)
+
+
+def _append_section(lines: list, entries: list, remaining: int, noun: str, heading: str) -> int:
+    """Add one budgeted block to a report; returns the budget left after it.
+
+    When the budget is already spent the block collapses to a single count
+    rather than an empty code fence.
+    """
+    body, omitted = _fit_entries(entries, max(remaining, 0))
+    if body:
+        lines.append(heading)
+        lines.append("```\n" + "\n".join(body) + "\n```")
+        if omitted:
+            lines.append(f"...and {omitted} more {noun}.")
+    else:
+        lines.append(f"{heading.rstrip(':')}: {len(entries)} {noun}, not listed -- the report is full.")
+    return remaining - sum(len(line) + 1 for line in body)
 
 
 def plan_relink(
@@ -1034,6 +1078,673 @@ def relink_warning(io_guild: str, display: str, other_characters: list) -> str |
         f"Note: {display} is also linked to {', '.join(sorted(other_characters))} "
         f"in {io_guild}. That may be a legitimate alt, but !mygains and !kick "
         f"will pick one of them arbitrarily."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Invites -- following an !invite until the invitee turns up in the roster.
+#
+# Nothing the game exposes says which account accepted an invite: the invite
+# response is only {"result": "true"}, other players' account data is
+# unreadable, and the guild node records no invites or joins. The one signal is
+# a new account id appearing in the roster, so everything below is about
+# deciding, from that alone, which invite an arrival belongs to -- and refusing
+# to decide when it can't be sure.
+# ---------------------------------------------------------------------------
+
+INVITE_PENDING = 'pending'
+INVITE_LINKED = 'linked'
+INVITE_DONE = 'done'
+INVITE_EXPIRED = 'expired'
+INVITE_SUPERSEDED = 'superseded'
+INVITE_CANCELLED = 'cancelled'
+INVITE_CONFLICT = 'conflict'
+INVITE_REPORTED = 'reported'
+INVITE_NEEDS_ATTENTION = 'needs_attention'
+
+# Still open: a re-invite merges into these, and they can link.
+INVITE_OPEN_STATUSES = (INVITE_PENDING, INVITE_EXPIRED)
+# Everything the matcher considers. Superseded and cancelled invites still
+# exist in game -- the bot can't withdraw one -- so their invitee can still
+# accept. They're here so that person is recognised and reported, never linked.
+INVITE_MATCHABLE_STATUSES = (INVITE_PENDING, INVITE_EXPIRED, INVITE_SUPERSEDED, INVITE_CANCELLED)
+
+# Active polling stops here and the mod channel is told.
+INVITE_TRACK_SECONDS = 24 * 3600
+# How long an unaccepted or superseded invite keeps counting as outstanding.
+# Without it, someone accepting an old or stray invite after the watch ended
+# would be matched by elimination to whoever's invite is pending at the time.
+INVITE_MEMORY_SECONDS = 7 * 24 * 3600
+
+# (age below which this row applies, poll every N seconds), keyed on the age
+# of the newest pending invite in the guild -- invitees usually accept within
+# minutes, so it starts fast and backs off, and a fresh invite speeds the
+# whole guild back up. One roster read covers every invite in that guild.
+INVITE_POLL_SCHEDULE = (
+    (2 * 60, 10),
+    (10 * 60, 30),
+    (60 * 60, 120),
+    (INVITE_TRACK_SECONDS, 600),
+)
+
+# Firebase id tokens last an hour; refresh this long before they expire.
+TOKEN_REFRESH_MARGIN = 300
+
+MATCH_BY_NAME = 'name'
+MATCH_BY_HISTORY = 'history'
+MATCH_BY_ELIMINATION = 'elimination'
+
+ACTION_LINK = 'link'
+ACTION_CONFLICT = 'conflict'
+ACTION_REPORT_SUPERSEDED = 'report_superseded'
+ACTION_REPORT_CANCELLED = 'report_cancelled'
+ACTION_REPORT_NO_MEMBER = 'report_no_member'
+
+# Sign-in failures that retrying will never fix. Retrying them every few
+# minutes from the poll would only accumulate failed logins on the account
+# !kick and the weekly export also depend on.
+PERMANENT_SIGNIN_ERRORS = (
+    'INVALID_PASSWORD',
+    'INVALID_LOGIN_CREDENTIALS',
+    'EMAIL_NOT_FOUND',
+    'USER_DISABLED',
+    'INVALID_EMAIL',
+)
+
+
+def name_key(name) -> str:
+    """The form names are compared in. Character names are unique game-wide,
+    so an exact match on this is certain."""
+    return str(name or '').strip().casefold()
+
+
+def invite_age(now: float, sent_at: float) -> float:
+    """Seconds since sent_at, never negative. The Pi has no clock battery, so a
+    boot before NTP syncs can briefly put "now" behind a stored time."""
+    return max(0.0, now - sent_at)
+
+
+def invite_poll_interval(age: float) -> int | None:
+    for limit, interval in INVITE_POLL_SCHEDULE:
+        if age < limit:
+            return interval
+    return None
+
+
+def should_poll_guild(now: float, newest_sent_at: float, last_polled_at: float | None) -> bool:
+    """Whether a guild's roster is due a read on this tick."""
+    interval = invite_poll_interval(invite_age(now, newest_sent_at))
+    if interval is None:
+        return False
+    if last_polled_at is None or now < last_polled_at:
+        return True
+    return now - last_polled_at >= interval
+
+
+def token_is_fresh(now: float, expires_at: float | None, margin: int = TOKEN_REFRESH_MARGIN) -> bool:
+    return expires_at is not None and now < expires_at - margin
+
+
+def classify_signin_error(message: str | None) -> str:
+    """'permanent' for a credentials problem, 'transient' for anything else.
+
+    Firebase error messages look like "INVALID_PASSWORD" or
+    "TOO_MANY_ATTEMPTS_TRY_LATER : Access to this account has been ...".
+    """
+    code = str(message or '').split(':')[0].strip()
+    return 'permanent' if code in PERMANENT_SIGNIN_ERRORS else 'transient'
+
+
+def parse_action_result(payload) -> str | None:
+    """The 'result' field of a cloud-function reply, or None if it has none.
+
+    invite and kick used to index data["result"] directly, so an error payload
+    -- an expired token, say -- surfaced as a KeyError instead of a failure.
+    """
+    if isinstance(payload, dict) and payload.get('result') is not None:
+        return str(payload['result'])
+    return None
+
+
+def action_succeeded(result_value: str | None) -> bool:
+    return result_value is not None and result_value.lower() == 'true'
+
+
+def parse_optional_id(value) -> int | None:
+    """A Discord id from the environment, or None when unset or malformed.
+
+    Optional on purpose: the existing int(os.environ.get(...)) pattern raises at
+    import when a variable is missing, so deploying new code before editing the
+    Pi's .env would stop the bot starting at all.
+    """
+    text = str(value).strip() if value is not None else ''
+    return int(text) if text.isdigit() else None
+
+
+_SECRET_PARAM_RE = re.compile(r'((?:auth|key|access_token|idToken|refreshToken)=)[^&\s\'"]+')
+_BEARER_RE = re.compile(r'(Bearer\s+)\S+')
+
+
+def redact_secrets(text) -> str:
+    """Remove tokens and keys from text bound for a log or a Discord channel.
+
+    The roster read passes its token as ?auth=, and requests includes the full
+    URL in its exception messages -- so an unredacted connection error would
+    post the guild leader's login token, which can invite and kick.
+    """
+    text = _SECRET_PARAM_RE.sub(r'\1<redacted>', str(text))
+    return _BEARER_RE.sub(r'\1<redacted>', text)
+
+
+def plan_invite_record(existing: list[dict], name: str, d_id, baseline) -> dict:
+    """How a new !invite lands among a guild's open invites.
+
+    There is at most one open invite per Discord account, so a second !invite
+    for the same member never leaves two waiting:
+
+    - same name (a rejected invite being re-sent, or a wrong @member being
+      corrected) merges into the existing row, and the new member wins;
+    - a different name for the same member (a typo corrected, or another of
+      their characters) supersedes the old row. A superseded invite can never
+      link anyone, because its name may belong to a stranger -- a typo can hit
+      a real player, who then has a genuine invite from the guild.
+
+    Baselines are intersected and the earliest first_sent_at kept, so a
+    re-invite can't hide an invitee who already arrived under the old one.
+    `existing` must hold only this guild's open invites.
+    """
+    key = name_key(name)
+    target = normalize_discord_id(d_id)
+
+    same_name = sorted(
+        (inv for inv in existing if inv['name_key'] == key),
+        key=lambda inv: (inv['sent_at'], inv['id']),
+    )
+    merge_into = same_name[-1] if same_name else None
+    supersede = [inv for inv in same_name[:-1]]
+    if target is not None:
+        supersede += [
+            inv for inv in existing
+            if inv['name_key'] != key and normalize_discord_id(inv.get('d_id')) == target
+        ]
+
+    related = ([merge_into] if merge_into else []) + supersede
+    merged = set(baseline)
+    for inv in related:
+        merged &= set(inv['baseline'])
+
+    return {
+        'merge_into': merge_into,
+        'supersede': supersede,
+        'baseline': merged,
+        'first_sent_at': min((inv['first_sent_at'] for inv in related), default=None),
+    }
+
+
+def _invite_arrivals(invite: dict, roster: dict, claims: dict) -> set:
+    """Characters in the roster that could be this invite's invitee.
+
+    Anyone in the baseline was already in the guild when it was sent. A
+    character another invite matched at or after this one was sent is taken --
+    that claim is what stops a returning member, matched to one invite without
+    any new row being written, from then being handed to a second invite.
+    """
+    baseline = set(invite['baseline'])
+    first = invite['first_sent_at']
+    return {
+        g_id for g_id in roster
+        if g_id not in baseline and not (g_id in claims and claims[g_id] >= first)
+    }
+
+
+def match_invites(
+    invites: list[dict],
+    roster: dict,
+    link_rows: list[dict],
+    claims: dict,
+    roster_fetched_at: float,
+) -> dict:
+    """Decide which arrivals belong to which invites, for one guild.
+
+    `invites` are this guild's invites in INVITE_MATCHABLE_STATUSES within
+    INVITE_MEMORY_SECONDS; `roster` maps game id to displayed name; `claims`
+    maps a game id to when an invite matched it. Re-run in full on every poll.
+
+    In order:
+      1. name -- an arrival displaying the invited name. Certain for an open
+         invite; for a superseded or cancelled one, reported instead.
+      2. Discord history -- exactly one arrival already has a link row for the
+         invite's account (a returning member, or a mod who !assign-ed by
+         hand), and no other open invite has a claim on it.
+      3. elimination -- one invite outstanding in the whole guild, one
+         arrival, and that arrival has no usable link rows, so linking it can
+         only ever insert. Expired and superseded invites count as outstanding;
+         cancelled ones don't, because !uninvite is a moderator saying the
+         person isn't coming, and it is how a stale invite is cleared.
+      4. anything else is returned unmatched, for a moderator.
+
+    Invites recorded after the roster was read are skipped: their baseline is
+    newer than the data, so it would make earlier members look like arrivals.
+    """
+    history: dict[str, set] = {}
+    for row in usable_links(link_rows):
+        history.setdefault(row['g_id'], set()).add(row['d_id'])
+
+    # An invite that already matched someone is finished, even if it was later
+    # cancelled -- its character is claimed, and it is not still waiting.
+    active = [
+        inv for inv in invites
+        if inv['status'] in INVITE_MATCHABLE_STATUSES
+        and not inv.get('matched_g_id')
+        and inv['baseline_at'] <= roster_fetched_at
+    ]
+    # Open invites first, so a name that is also on an older superseded or
+    # cancelled invite goes to the live one.
+    active.sort(key=lambda inv: (
+        inv['status'] not in INVITE_OPEN_STATUSES, inv['sent_at'], inv['id'],
+    ))
+    arrivals = {inv['id']: _invite_arrivals(inv, roster, claims) for inv in active}
+
+    actions: list[dict] = []
+    matched: set = set()
+    used: set = set()
+
+    def settle(inv, g_id, kind, method):
+        actions.append({
+            'invite': inv, 'g_id': g_id, 'name': roster[g_id], 'kind': kind, 'method': method,
+            'other_accounts': sorted(history.get(g_id, set()) - {normalize_discord_id(inv.get('d_id'))}),
+        })
+        matched.add(inv['id'])
+        used.add(g_id)
+
+    for inv in active:
+        hits = [g for g in arrivals[inv['id']] - used if name_key(roster[g]) == inv['name_key']]
+        if len(hits) != 1:
+            continue
+        g_id = hits[0]
+        target = normalize_discord_id(inv.get('d_id'))
+        rivals = [
+            other for other in active
+            if other['id'] != inv['id'] and other['status'] in INVITE_OPEN_STATUSES
+            and normalize_discord_id(other.get('d_id')) not in (None, target)
+            and normalize_discord_id(other.get('d_id')) in history.get(g_id, set())
+        ]
+        if inv['status'] == INVITE_SUPERSEDED:
+            kind = ACTION_REPORT_SUPERSEDED
+        elif inv['status'] == INVITE_CANCELLED:
+            kind = ACTION_REPORT_CANCELLED
+        elif rivals:
+            kind = ACTION_CONFLICT
+        elif target is None:
+            kind = ACTION_REPORT_NO_MEMBER
+        else:
+            kind = ACTION_LINK
+        settle(inv, g_id, kind, MATCH_BY_NAME)
+
+    def history_arrivals(inv):
+        # Claims deliberately don't apply here. An arrival already linked to
+        # this invite's own account is its invitee, even if another invite
+        # reported it first -- that is how a moderator's !assign after a
+        # reported match (the same person under another character name) lets
+        # the invite finish instead of expiring as "not accepted".
+        target = normalize_discord_id(inv.get('d_id'))
+        baseline = set(inv['baseline'])
+        return {g for g in roster if g not in baseline and target in history.get(g, set())}
+
+    for inv in active:
+        if inv['id'] in matched or inv['status'] not in INVITE_OPEN_STATUSES:
+            continue
+        target = normalize_discord_id(inv.get('d_id'))
+        if target is None:
+            continue
+        candidates = sorted(history_arrivals(inv) - used)
+        if len(candidates) != 1:
+            continue
+        g_id = candidates[0]
+        contested = any(
+            other['id'] != inv['id'] and other['id'] not in matched
+            and other['status'] in INVITE_OPEN_STATUSES
+            and normalize_discord_id(other.get('d_id')) not in (None, target)
+            and g_id in history_arrivals(other)
+            for other in active
+        )
+        if not contested:
+            settle(inv, g_id, ACTION_LINK, MATCH_BY_HISTORY)
+
+    outstanding = [
+        inv for inv in active if inv['id'] not in matched and inv['status'] != INVITE_CANCELLED
+    ]
+    if len(outstanding) == 1:
+        inv = outstanding[0]
+        candidates = arrivals[inv['id']] - used
+        if (
+            inv['status'] == INVITE_PENDING
+            and normalize_discord_id(inv.get('d_id')) is not None
+            and len(candidates) == 1
+        ):
+            g_id = next(iter(candidates))
+            if not history.get(g_id):
+                settle(inv, g_id, ACTION_LINK, MATCH_BY_ELIMINATION)
+
+    unmatched: dict[str, dict] = {}
+    for inv in active:
+        if inv['id'] in matched:
+            continue
+        for g_id in sorted(arrivals[inv['id']] - used):
+            entry = unmatched.setdefault(g_id, {
+                'g_id': g_id,
+                'name': roster[g_id],
+                'invites': [],
+                'linked_to': sorted(history.get(g_id, set())),
+            })
+            entry['invites'].append(inv)
+
+    return {'actions': actions, 'unmatched': list(unmatched.values())}
+
+
+def plan_invite_link(existing_rows: list[dict], target_d_id) -> tuple[str, list]:
+    """How to link a character to an invite's account without deleting anything.
+
+    Returns ('conflict', [other accounts]) when a usable row points at a
+    different account -- a rejoin under a new Discord account, or a mod who
+    linked it elsewhere; a moderator settles that with !relink. ('keep', [])
+    when a row already points at the target; ('insert', []) otherwise.
+
+    Unlike plan_relink this never plans a delete. plan_relink also removes
+    duplicate rows for the *same* account, so treating "would delete" as
+    "conflict" would flag every returning member who once had !assign run twice
+    -- four characters in the live data today.
+    """
+    target = normalize_discord_id(target_d_id)
+    if target is None:
+        raise ValueError(f"Not a usable Discord id to link to: {target_d_id!r}")
+    accounts = {
+        normalize_discord_id(row.get('d_id')) for row in existing_rows
+    } - {None}
+    others = sorted(accounts - {target})
+    if others:
+        return 'conflict', others
+    if target in accounts:
+        return 'keep', []
+    return 'insert', []
+
+
+def roster_changed(rows: list[dict], current_pairs) -> bool:
+    """Whether membership or any displayed name differs from what is stored.
+
+    GP deliberately isn't compared: it ticks up constantly, so comparing it
+    would rewrite {guild}_game on nearly every poll to store the same people.
+    """
+    return {(row['G_ID'], row['G_NAME']) for row in rows} != {tuple(pair) for pair in current_pairs}
+
+
+def validate_roster_rows(rows: list[dict], current_count: int) -> str | None:
+    """Why a freshly read roster must not be written to {guild}_game, or None.
+
+    A NULL game id reaching {guild}_GP would make GP_databases' `NOT IN` match
+    nothing, silently stopping every new member from being tracked. And a
+    roster that has suddenly lost half its members is far likelier to be a
+    partial read than a mass exodus.
+    """
+    if not rows:
+        return "the roster came back empty"
+    for row in rows:
+        g_id, g_name, gp = row.get('G_ID'), row.get('G_NAME'), row.get('GP')
+        if not isinstance(g_id, str) or not g_id.strip():
+            return "a member has no game id"
+        if not isinstance(g_name, str) or not g_name.strip():
+            return "a member has no name"
+        if isinstance(gp, bool) or not isinstance(gp, int):
+            return "a member's GP is not a whole number"
+    if current_count and len(rows) * 2 < current_count:
+        return f"the roster shrank from {current_count} to {len(rows)} members"
+    return None
+
+
+WELCOME_TEXT = (
+    "{member} Welcome to the guild!\n"
+    "Our guild's home world is Skull 1, so please switch to it and set it as a favorite!\n"
+    "GP is counted each Saturday, which means your in-game counter does not represent "
+    "your actual GP earned. Please read {welcome_channel} for more information.\n"
+    "If you are a Pretherian and you want to be eligible to be promoted to Aetherians "
+    "later on, pick up the role here: {roles_channel}\n"
+    "\n"
+    "If you want to ask any questions or join discussions, don't hesitate to do so. "
+    "Let's grow strong together!"
+)
+
+# One entry per guild so they can diverge later without a code change; the
+# same text for both today.
+WELCOME_MESSAGES = {guild: WELCOME_TEXT for guild in GUILD_NAMES}
+
+
+def format_welcome(io_guild: str, d_id, welcome_channel_id: int, roles_channel_id: int) -> str:
+    """The welcome for a new member of io_guild.
+
+    Filled with str.replace rather than str.format, so a literal brace anyone
+    adds to the text later can't turn every welcome into a KeyError.
+    """
+    return (
+        WELCOME_MESSAGES[io_guild]
+        .replace('{member}', f'<@{d_id}>')
+        .replace('{welcome_channel}', f'<#{welcome_channel_id}>')
+        .replace('{roles_channel}', f'<#{roles_channel_id}>')
+    )
+
+
+def suggest_assign_command(io_guild: str, d_id, name: str) -> str:
+    """A ready-to-paste !assign. !assign parses the user as int(...) first, so
+    this uses the numeric id -- a mention would fall through to a name lookup."""
+    return f"!assign {io_guild} {normalize_discord_id(d_id) or '<discord id>'} {name}"
+
+
+def _invitee(invite: dict) -> str:
+    d_id = normalize_discord_id(invite.get('d_id'))
+    return f"<@{d_id}>" if d_id else "no Discord member given"
+
+
+def format_invite_ack(
+    io_guild: str,
+    name: str,
+    member_label: str | None,
+    record: dict,
+    send_confirmed: bool,
+    member_has_role: bool,
+    warnings: list[str] = (),
+) -> str:
+    """The reply to !invite, stating exactly what happened to earlier invites."""
+    lines = []
+    if send_confirmed:
+        lines.append(f"Invite sent to **{name}** for {io_guild}.")
+    else:
+        lines.append(
+            f"The invite to **{name}** may or may not have gone through -- the game "
+            f"didn't answer in time. I'm watching for them anyway; if they don't get "
+            f"it, run the same !invite again."
+        )
+    if member_label:
+        lines.append(f"When they join I'll link them to {member_label}.")
+        if member_has_role:
+            lines.append(f"They already have the {io_guild} role, so no welcome will be posted.")
+    else:
+        lines.append(
+            "No Discord member was given, so when they join I'll report it with a "
+            "ready !assign instead of linking them."
+        )
+    if record.get('outcome') == 'merged':
+        lines.append("This replaces the earlier invite with the same name and restarts the 24 h watch.")
+        if record.get('previous_d_id') != normalize_discord_id(record.get('d_id')):
+            before = record.get('previous_d_id')
+            lines.append(
+                f"It now belongs to {member_label or 'no Discord member'}"
+                + (f" (was <@{before}>)." if before else ".")
+            )
+    for old in record.get('superseded', ()):
+        lines.append(
+            f"Your earlier invite to **{old}** for the same member is replaced. If "
+            f"'{old}' still accepts it, I'll report them rather than link them."
+        )
+    lines.extend(warnings)
+    return "\n".join(lines)
+
+
+def format_invite_linked(
+    io_guild: str,
+    invite: dict,
+    character: str,
+    g_id: str,
+    method: str,
+    role_added: bool,
+    former_removed: bool,
+    welcome_note: str | None,
+) -> str:
+    """Mod-channel note that an invite was completed."""
+    lines = [f"**{io_guild}** -- {_invitee(invite)} joined as **{character}** (`{g_id}`)."]
+    if method == MATCH_BY_ELIMINATION:
+        lines.append(
+            f"Matched by elimination: the invite was for '{invite['invited_name']}' and "
+            f"nobody else was expected. If that's the wrong person, !relink fixes it."
+        )
+    elif method == MATCH_BY_HISTORY:
+        lines.append("Matched through an existing link to that Discord account.")
+    elif name_key(character) != invite['name_key']:
+        lines.append(f"(Invited as '{invite['invited_name']}'.)")
+    if role_added:
+        lines.append(f"Gave them the {io_guild} role" + (" and removed 'Former Aetherian'." if former_removed else "."))
+    else:
+        lines.append(
+            f"The {io_guild} role was already present -- welcome may not have been sent."
+            + (" Removed 'Former Aetherian'." if former_removed else "")
+        )
+    if welcome_note:
+        lines.append(welcome_note)
+    return "\n".join(lines)
+
+
+def format_invite_conflict(io_guild: str, invite: dict, character: str, g_id: str, others: list) -> str:
+    """A match that can't be linked without removing someone else's link."""
+    accounts = ", ".join(f"<@{d_id}>" for d_id in others)
+    return (
+        f"**{io_guild}** -- **{character}** (`{g_id}`) joined for the invite to "
+        f"{_invitee(invite)}, but is already linked to {accounts}. Nothing was changed. "
+        f"If this is a rejoin under a new Discord account, run "
+        f"`!relink {g_id} {normalize_discord_id(invite.get('d_id')) or '<discord id>'}`, "
+        f"then give them the {io_guild} role and welcome them by hand -- I won't finish "
+        f"this one myself."
+    )
+
+
+def format_invite_superseded(io_guild: str, invite: dict, character: str, g_id: str) -> str:
+    return (
+        f"**{io_guild}** -- **{character}** (`{g_id}`) joined: the name from the invite "
+        f"you replaced for {_invitee(invite)}. Not linked. If that is the same person, "
+        f"`{suggest_assign_command(io_guild, invite.get('d_id'), character)}`; otherwise "
+        f"they aren't who you meant to invite."
+    )
+
+
+def format_invite_cancelled_arrival(io_guild: str, invite: dict, character: str, g_id: str) -> str:
+    return (
+        f"**{io_guild}** -- **{character}** (`{g_id}`) joined for the invite to "
+        f"'{invite['invited_name']}' that was cancelled with !uninvite. Not linked. If "
+        f"they should be, `{suggest_assign_command(io_guild, invite.get('d_id'), character)}`."
+    )
+
+
+def format_invite_unlinkable(io_guild: str, invite: dict, character: str, g_id: str) -> str:
+    """A certain match on an invite that has no Discord member to link to."""
+    return (
+        f"**{io_guild}** -- **{character}** (`{g_id}`) joined for the invite to "
+        f"'{invite['invited_name']}'. No Discord member was given, so they aren't linked: "
+        f"`{suggest_assign_command(io_guild, None, character)}`"
+    )
+
+
+def format_unmatched_arrival(io_guild: str, arrival: dict) -> str:
+    """An arrival the bot couldn't attribute to one invite."""
+    lines = [
+        f"**{io_guild}** -- **{arrival['name']}** (`{arrival['g_id']}`) joined and I "
+        f"couldn't tell which invite it belongs to."
+    ]
+    if arrival['linked_to']:
+        lines.append("Already linked to " + ", ".join(f"<@{d}>" for d in arrival['linked_to']) + ".")
+    if arrival['invites']:
+        lines.append("Outstanding invites:")
+        lines += [
+            f"  - '{inv['invited_name']}' for {_invitee(inv)} ({inv['status']}): "
+            f"`{suggest_assign_command(io_guild, inv.get('d_id'), arrival['name'])}`"
+            for inv in arrival['invites']
+        ]
+    return "\n".join(lines)
+
+
+def format_invite_expired(io_guild: str, invite: dict) -> str:
+    return (
+        f"**{io_guild}** -- the invite to '{invite['invited_name']}' for {_invitee(invite)} "
+        f"wasn't accepted within 24 h, so I've stopped watching for it. If they're not "
+        f"coming, `!uninvite {io_guild} {invite['invited_name']}` -- until then it keeps "
+        f"automatic matching cautious for a week. A late join shows up in the weekly "
+        f"unlinked list."
+    )
+
+
+def format_invite_needs_attention(io_guild: str, invite: dict, character: str | None, reason: str) -> str:
+    who = f"**{character}** for {_invitee(invite)}" if character else _invitee(invite)
+    return (
+        f"**{io_guild}** -- linked {who}, but couldn't finish: {reason}. The link row is in "
+        f"place; the role and welcome need doing by hand."
+    )
+
+
+def format_invite_cancelled_midway(io_guild: str, invite: dict, character: str | None) -> str:
+    """!uninvite landed after the role was given but before the welcome."""
+    return (
+        f"**{io_guild}** -- the invite for {_invitee(invite)} was cancelled while I was "
+        f"linking **{character}**. No welcome was posted, but the {io_guild} role had "
+        f"already been given -- remove it by hand if this was the wrong person."
+    )
+
+
+def format_invite_member_gone(io_guild: str, invite: dict, character: str) -> str:
+    return (
+        f"**{io_guild}** -- linked **{character}** to {_invitee(invite)}, but they aren't "
+        f"in the Discord server, so no role or welcome."
+    )
+
+
+INVITES_LIST_LIMIT = 15
+
+
+def format_invites_list(invites: list[dict], now: float, limit: int = INVITES_LIST_LIMIT) -> str:
+    """!invites -- what's being watched for, newest first, capped to fit a message."""
+    if not invites:
+        return "No open invites."
+    ordered = sorted(invites, key=lambda i: -i['sent_at'])
+    lines = []
+    if len(ordered) > limit:
+        lines.append(f"(newest {limit} of {len(ordered)})")
+    for inv in ordered[:limit]:
+        age = invite_age(now, inv['sent_at'])
+        when = f"{int(age // 3600)} h" if age >= 3600 else f"{int(age // 60)} min"
+        extra = "" if inv.get('send_confirmed', 1) else ", send unconfirmed"
+        lines.append(
+            f"{inv['guild']}  '{inv['invited_name']}' for {_invitee(inv)}  -- "
+            f"{inv['status']}, {when} ago{extra}"
+        )
+    return "\n".join(lines)
+
+
+def format_uninvite(io_guild: str, invite: dict) -> str:
+    if invite['status'] in (INVITE_LINKED, INVITE_NEEDS_ATTENTION):
+        return (
+            f"Cancelled the invite to '{invite['invited_name']}' -- no role or welcome will "
+            f"be sent. It was already linked to **{invite.get('matched_name')}** "
+            f"(`{invite.get('matched_g_id')}`); that link row is still there. If it's wrong, "
+            f"`!relink` fixes it."
+        )
+    return (
+        f"Stopped watching for '{invite['invited_name']}' in {io_guild}. The invite itself "
+        f"still stands in game -- if they accept it anyway, I'll report it rather than link them."
     )
 
 
