@@ -79,6 +79,12 @@ class TestLinkGaps:
         assert gaps['game_no_link'] == ["Alpha", "Bravo", "Charlie"]
         assert gaps['role_no_link'] == ["two"]
 
+    def test_a_character_with_no_name_isnt_shown_by_its_game_id(self):
+        gaps = logic.link_gaps([], {"steam_76561198645315575": ("", 1)}, {})
+        assert gaps['game_no_link'] == [logic.UNNAMED_CHARACTER]
+        gaps = logic.link_gaps([link("1", "steam_7656")], {"steam_7656": ("", 1)}, {})
+        assert gaps['no_role'] == [logic.UNNAMED_CHARACTER]
+
     def test_sorted_ignoring_case(self):
         live = {"A": ("beta", 1), "B": ("Alpha", 1), "C": ("Gamma", 1)}
         assert logic.link_gaps([], live, {})['game_no_link'] == ["Alpha", "beta", "Gamma"]
@@ -190,11 +196,27 @@ class FakeServer:
 class TestLinksReport:
     def test_asks_discord_who_is_still_in_the_server(self, temp_functions_db):
         make_link_tables()
-        server = FakeServer({1: SimpleNamespace(roles=[SimpleNamespace(name="Other")])})
-        [embed] = Functions.links_report(GUILD, server)
+        member = SimpleNamespace(roles=[SimpleNamespace(name="Other")], display_name="Honeycomb", name="honey")
+        [embed] = Functions.links_report(GUILD, FakeServer({1: member}))
         assert embed.title == f"{GUILD} -- links"
-        assert "Linked, in the server without the role:\n```\nAlpha  (Here)" in embed.description
+        # Named as Discord shows them now, not as stored at !assign ("Here").
+        assert "Linked, in the server without the role:\n```\nAlpha  (Honeycomb (honey))" in embed.description
         assert "Linked, but left the Discord server:\n```\nBravo" in embed.description
+
+    def test_without_the_server_nobody_reads_as_having_left(self, temp_functions_db):
+        """!weekly_report and !conflicts pass whatever bot.get_guild returns,
+        which is None when the server isn't cached."""
+        make_link_tables()
+        [embed] = Functions.links_report(GUILD, None)
+        assert "left the Discord server" not in embed.description
+        assert "Linked, but without the role:\n```\nAlpha\nBravo" in embed.description
+
+    def test_junk_role_holder_ids_are_dropped(self, temp_functions_db):
+        Functions.write_discord_roster(GUILD, [
+            {'Discord': "a#0", 'D_ID': 5, 'Display': "A"},
+            {'Discord': "", 'D_ID': None, 'Display': ""},
+        ])
+        assert Functions._load_role_holders(GUILD) == {"5": ("A", "a#0")}
 
     def test_an_incomplete_member_cache_doesnt_read_as_everyone_leaving(self, temp_functions_db):
         make_link_tables()
@@ -225,14 +247,15 @@ class TestRefreshDiscordRosters:
             SimpleNamespace(name=name, members=[FakeMember(n, f"Member {n}") for n in (1, 2)])
             for name in logic.GUILD_NAMES
         ])
-        assert bot.refresh_discord_rosters() == []
+        assert bot.refresh_discord_rosters() == ([], list(logic.GUILD_NAMES))
         rows = Functions.c.execute(f'SELECT Discord, D_ID, Display FROM "{GUILD}_discord"').fetchall()
         assert rows == [("user1#0", 1, "Member 1"), ("user2#0", 2, "Member 2")]
 
     def test_a_missing_role_is_a_warning_and_leaves_the_table(self, bot, monkeypatch):
         Functions.write_discord_roster(GUILD, discord_rows(7))
         use_server(bot, monkeypatch, [])
-        warnings = bot.refresh_discord_rosters()
+        warnings, refreshed = bot.refresh_discord_rosters()
+        assert refreshed == []
         assert [w.title for w in warnings] == [f"{name} -- role list not refreshed" for name in logic.GUILD_NAMES]
         assert "no 'Aetherians' role" in warnings[0].description
         assert Functions.c.execute(f'SELECT D_ID FROM "{GUILD}_discord"').fetchall() == [(7,)]
@@ -242,5 +265,41 @@ class TestRefreshDiscordRosters:
         use_server(bot, monkeypatch, [
             SimpleNamespace(name=name, members=[FakeMember(1, "One")]) for name in logic.GUILD_NAMES
         ])
-        [warning] = bot.refresh_discord_rosters()
+        [warning], refreshed = bot.refresh_discord_rosters()
+        assert refreshed == ["Pretherians"]
         assert warning.title == f"{GUILD} -- role list not refreshed" and "shrank" in warning.description
+
+
+class FakeCtx:
+    def __init__(self):
+        self.sent = []
+        self.channel = SimpleNamespace(guild=None)
+
+    async def send(self, content=None, **kwargs):
+        self.sent.append((content, kwargs))
+
+
+class TestMembersDiscordReply:
+    def test_a_partial_refresh_says_what_was_saved(self, bot, monkeypatch):
+        Functions.write_discord_roster(GUILD, discord_rows(*range(1, 11)))
+        use_server(bot, monkeypatch, [
+            SimpleNamespace(name=name, members=[FakeMember(1, "One")]) for name in logic.GUILD_NAMES
+        ])
+        ctx = FakeCtx()
+        asyncio.run(bot.members_discord.callback(ctx))
+        [(content, kwargs)] = ctx.sent
+        assert content == "Discord members exported: Pretherians"
+        assert [e.title for e in kwargs['embeds']] == [f"{GUILD} -- role list not refreshed"]
+
+
+class TestExportValidation:
+    def test_an_empty_roster_is_not_written(self, bot, monkeypatch):
+        """Firebase returning {} passes fetch_guild_roster's dict check."""
+        Functions.write_game_roster(GUILD, [{'G_ID': "A", 'G_NAME': "Alpha", 'GP': 1}])
+
+        async def empty(guild_name, from_poll=False):
+            return []
+        monkeypatch.setattr(bot, "fetch_guild_roster", empty)
+        with pytest.raises(ValueError, match="came back empty"):
+            asyncio.run(bot.export_game_rosters([GUILD]))
+        assert Functions.game_roster_size(GUILD) == 1

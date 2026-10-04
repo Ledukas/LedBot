@@ -439,26 +439,25 @@ def _load_link_snapshot(IOguild):
         if key is not None:
             live_characters[key] = (g_name, logic.parse_gp_value(gp))
 
-    live_accounts = {}
-    for d_id, discord_name, display in c.execute(
-        f"SELECT D_ID, Discord, Display FROM {table_discord}"
-    ).fetchall():
-        key = logic.normalize_discord_id(d_id)
-        if key is not None:
-            live_accounts[key] = display or discord_name
+    live_accounts = {
+        d_id: display or discord_name
+        for d_id, (display, discord_name) in _load_role_holders(IOguild).items()
+    }
 
     return links, live_characters, live_accounts
 
 
-def _load_role_holder_labels(IOguild):
-    """{d_id: how the account is named} for the guild role's holders."""
-    return {
-        logic.normalize_discord_id(d_id): logic.account_label(display, discord_name)
-        for d_id, discord_name, display in c.execute(
-            f"SELECT D_ID, Discord, Display FROM {logic.table_name(IOguild, 'discord')}"
-        ).fetchall()
-        if logic.normalize_discord_id(d_id) is not None
-    }
+def _load_role_holders(IOguild):
+    """{d_id: (display, username)} for the guild role's holders -- the one
+    reader of {guild}_discord, so whois and the links section agree on it."""
+    holders = {}
+    for d_id, discord_name, display in c.execute(
+        f"SELECT D_ID, Discord, Display FROM {logic.table_name(IOguild, 'discord')}"
+    ).fetchall():
+        key = logic.normalize_discord_id(d_id)
+        if key is not None:
+            holders[key] = (display, discord_name)
+    return holders
 
 
 def links_report(IOguild, discord_guild=None):
@@ -476,12 +475,21 @@ def links_report(IOguild, discord_guild=None):
     try:
         links, live_characters, _ = _load_link_snapshot(IOguild)
         character_conflicts, account_conflicts = logic.find_link_conflicts(links, live_characters)
-        server = None
+        server, live_names = None, {}
         if discord_guild is not None and discord_guild.chunked:
             server = _resolve_role_holders(discord_guild, IOguild, {
                 row['d_id'] for row in logic.usable_links(links) if row['g_id'] in live_characters
             })
-        gaps = logic.link_gaps(links, live_characters, _load_role_holder_labels(IOguild), server)
+            # The names stored at !assign time go stale; these are what a mod
+            # will find in the member list.
+            for d_id in server:
+                member = discord_guild.get_member(int(d_id))
+                live_names[d_id] = logic.account_label(member.display_name, member.name)
+        role_holders = {
+            d_id: logic.account_label(display, discord_name)
+            for d_id, (display, discord_name) in _load_role_holders(IOguild).items()
+        }
+        gaps = logic.link_gaps(links, live_characters, role_holders, server, live_names)
         return logic.section_embeds(
             IOguild, "links", logic.format_links(character_conflicts, account_conflicts, gaps),
         )
@@ -1184,6 +1192,12 @@ def write_discord_roster(IOguild, rows):
     except Exception:
         conn.rollback()
         raise
+
+
+def game_roster_size(IOguild):
+    table = logic.table_name(IOguild, 'game')
+    _ensure_game_table(table)
+    return c.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
 
 
 def refresh_discord_roster(IOguild, rows):

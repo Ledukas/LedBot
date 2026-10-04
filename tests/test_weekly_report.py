@@ -231,7 +231,7 @@ class TestBuilders:
             raise ValueError("unexpected value")
         monkeypatch.setattr(Functions, "_load_gp_series", lambda guild: {})
         monkeypatch.setattr(Functions, "_load_link_snapshot", lambda guild: ([], {}, {}))
-        monkeypatch.setattr(Functions, "_load_role_holder_labels", lambda guild: {})
+        monkeypatch.setattr(Functions, "_load_role_holders", lambda guild: {})
         monkeypatch.setattr(logic, "format_gp_audit", broken)
         monkeypatch.setattr(logic, "format_links", broken)
         for build in (Functions.gp_audit_report, Functions.links_report):
@@ -292,9 +292,9 @@ def weekly(temp_functions_db, no_bot_run, monkeypatch, tmp_path):
             calls.append(name)
         return stub
 
-    def refresh_discord_rosters():
-        calls.append("refresh_discord")
-        return list(state.discord_warnings)
+    def refresh_discord_rosters(guild_names=logic.GUILD_NAMES):
+        calls.append(f"refresh_discord:{','.join(guild_names)}")
+        return list(state.discord_warnings), list(guild_names)
 
     async def gp_dataframe(guild, today=None):
         state.dataframe_days.append(today)
@@ -315,6 +315,8 @@ def weekly(temp_functions_db, no_bot_run, monkeypatch, tmp_path):
     )
     monkeypatch.setattr(LedBotCode, "LedukasSpam_channel", mod)
     monkeypatch.setattr(LedBotCode, "LedukasSpam_channelID", MOD_CHANNEL_ID)
+    # A contended lock binds to its event loop, and each test runs its own.
+    monkeypatch.setattr(LedBotCode, "roster_export_lock", asyncio.Lock())
     monkeypatch.setattr(LedBotCode, "export_game_rosters", step("export"))
     monkeypatch.setattr(LedBotCode, "refresh_discord_rosters", refresh_discord_rosters)
     monkeypatch.setattr(LedBotCode, "run_backup", lambda: Path("Backups/Database_2026_10_03.db"))
@@ -466,7 +468,8 @@ class TestDiscordRefreshInTheWeeklyRun:
         window short, and the snapshot doesn't read the role list."""
         run(weekly)
         calls = weekly.calls
-        assert calls.index("GP_databases") < calls.index("refresh_discord") < calls.index("red:Aetherians")
+        refresh = "refresh_discord:Aetherians,Pretherians"
+        assert calls.index("GP_databases") < calls.index(refresh) < calls.index("red:Aetherians")
 
     def test_its_warnings_open_the_report(self, weekly):
         weekly.discord_warnings = [logic.warning_embed("Aetherians -- role list not refreshed", "x")]
@@ -476,12 +479,38 @@ class TestDiscordRefreshInTheWeeklyRun:
         assert titles == ["Aetherians -- role list not refreshed", "Aetherians -- links"]
 
 
+class TestRosterExportLock:
+    def test_the_weekly_export_waits_for_a_sync_counters_export(self, weekly):
+        """A !sync_counters export awaiting Firebase at 2 AM would otherwise
+        land its older roster between the weekly export and the snapshot."""
+        async def scenario():
+            await weekly.module.roster_export_lock.acquire()
+            job = asyncio.create_task(weekly.module.run_weekly_gp())
+            for _ in range(5):
+                await asyncio.sleep(0)
+            assert "export" not in weekly.calls
+            weekly.module.roster_export_lock.release()
+            await job
+        asyncio.run(scenario())
+        assert weekly.calls.index("export") < weekly.calls.index("GP_databases")
+
+    def test_a_refresh_crash_after_the_snapshot_is_not_a_rerun(self, weekly, monkeypatch):
+        def broken(guild_names=logic.GUILD_NAMES):
+            raise AttributeError("roles")
+        monkeypatch.setattr(weekly.module, "refresh_discord_rosters", broken)
+        weekly.sections["red:Aetherians"] = section("Aetherians -- red GP (40)")
+        with pytest.raises(weekly.module.WeeklyReportIncomplete):
+            run(weekly)
+        titles = [embed.title for embed in weekly.mod.sent[0][1]['embeds']]
+        assert titles == ["Role lists not refreshed", "Aetherians -- red GP (40)"]
+
+
 class TestSyncCounters:
     def test_refreshes_both_sides_then_posts_one_message(self, weekly):
         weekly.sections["links:Aetherians"] = section("Aetherians -- links")
         here = FakeChannel(channel_id=1)
         asyncio.run(weekly.module.sync_counters.callback(FakeContext(here), None))
-        assert weekly.calls[:2] == ["export", "refresh_discord"]
+        assert weekly.calls[:3] == ["export", "export", "refresh_discord:Aetherians,Pretherians"]
         [(content, kwargs)] = here.sent
         assert content == "Pretherians: everything is linked."
         assert [embed.title for embed in kwargs['embeds']] == ["Aetherians -- links"]
@@ -494,11 +523,35 @@ class TestSyncCounters:
         here = FakeChannel(channel_id=1)
         asyncio.run(weekly.module.sync_counters.callback(FakeContext(here), None))
         [(_, kwargs)] = here.sent
-        failure, links = kwargs['embeds']
-        assert failure.title == "In-game roster not refreshed"
-        assert "previous roster" in failure.description
+        *failures, links = kwargs['embeds']
+        assert [f.title for f in failures] == [
+            f"{name} -- in-game roster not refreshed" for name in logic.GUILD_NAMES
+        ]
+        assert "The Pretherians in-game lists below are from the previous roster." in failures[1].description
         assert links.title == "Pretherians -- links"
-        assert "refresh_discord" in weekly.calls
+        assert "refresh_discord:Aetherians,Pretherians" in weekly.calls
+
+    def test_only_the_guild_that_failed_is_called_stale(self, weekly, monkeypatch):
+        async def export(guild_names):
+            if guild_names == ["Pretherians"]:
+                raise RuntimeError("timed out")
+        monkeypatch.setattr(weekly.module, "export_game_rosters", export)
+        here = FakeChannel(channel_id=1)
+        asyncio.run(weekly.module.sync_counters.callback(FakeContext(here), None))
+        titles = [embed.title for embed in here.sent[0][1]['embeds']]
+        assert titles == ["Pretherians -- in-game roster not refreshed"]
+
+    def test_one_guild_refreshes_only_that_guild(self, weekly, monkeypatch):
+        exported = []
+
+        async def export(guild_names):
+            exported.extend(guild_names)
+        monkeypatch.setattr(weekly.module, "export_game_rosters", export)
+        here = FakeChannel(channel_id=1)
+        asyncio.run(weekly.module.sync_counters.callback(FakeContext(here), "Pretherians"))
+        assert exported == ["Pretherians"]
+        assert "refresh_discord:Pretherians" in weekly.calls
+        assert not any(call.endswith(":Aetherians") for call in weekly.calls)
 
     def test_refused_while_a_weekly_run_is_going(self, weekly, monkeypatch):
         """It writes {guild}_game, which the weekly job reads between its

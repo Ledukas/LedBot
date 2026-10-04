@@ -855,6 +855,10 @@ def account_label(display: str | None, discord_name: str | None) -> str:
     return display
 
 
+# Not the game id: the lists are names only, and !whois finds a character by id.
+UNNAMED_CHARACTER = "(a character with no name)"
+
+
 def _names_sorted(names) -> list[str]:
     return sorted(names, key=str.casefold)
 
@@ -864,6 +868,7 @@ def link_gaps(
     live_characters: dict,
     role_holders: dict,
     server: dict | None = None,
+    live_names: dict | None = None,
 ) -> dict[str, list[str]]:
     """Who is missing a link, a role, or a character, as named lists.
 
@@ -872,6 +877,8 @@ def link_gaps(
     are in the Discord server right now, asked of Discord; anyone absent from
     it has left. Without it, "linked but without the role" can't say which of
     the two it is, so it is one combined list read from `role_holders`.
+    `live_names` names those accounts as Discord shows them now; the names on
+    the link rows are frozen at !assign time.
 
     A character counts as having the role when any of its linked accounts
     does -- with a split, one holder is enough. "Has the role, no character in
@@ -896,13 +903,16 @@ def link_gaps(
     for g_id, rows in rows_by_character.items():
         if any(holds_role(row['d_id']) for row in rows):
             continue
-        name = character_name(live_characters[g_id]) or g_id
+        name = character_name(live_characters[g_id]) or UNNAMED_CHARACTER
         if server is None:
             without_role.append(name)
             continue
         present = [row for row in rows if row['d_id'] in server]
         if present:
-            account = account_label(present[0].get('display'), present[0].get('discord'))
+            d_id = present[0]['d_id']
+            account = (live_names or {}).get(d_id) or account_label(
+                present[0].get('display'), present[0].get('discord')
+            )
             in_server.append(f"{name}  ({account})")
         else:
             left.append(name)
@@ -912,7 +922,7 @@ def link_gaps(
             label for d_id, label in role_holders.items() if d_id not in linked_d_ids
         ),
         'game_no_link': _names_sorted(
-            character_name(entry) or g_id
+            character_name(entry) or UNNAMED_CHARACTER
             for g_id, entry in live_characters.items() if g_id not in linked_g_ids
         ),
         'no_role_in_server': _names_sorted(in_server),

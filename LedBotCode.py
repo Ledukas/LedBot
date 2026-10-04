@@ -154,22 +154,24 @@ async def export_data(ctx):
 @bot.command(name='members_discord')
 @commands.has_role("Moderator")
 async def members_discord(ctx):
-    warnings = refresh_discord_rosters()
+    warnings, refreshed = refresh_discord_rosters()
+    saved = f"Discord members exported: {', '.join(refreshed)}" if refreshed else None
     if warnings:
-        await send_embeds(ctx, warnings)
+        await send_embeds(ctx, warnings, saved)
     else:
-        await ctx.send("Discord members exported")
+        await ctx.send(saved)
 
 
-def refresh_discord_rosters():
+def refresh_discord_rosters(guild_names=logic.GUILD_NAMES):
     """Save who holds each guild role into {guild}_discord.
 
-    Returns warning embeds for anything not refreshed. A refused or failed
-    write leaves the previous list in place, which the links lists then use.
+    Returns (warning embeds for anything not refreshed, the guilds that were).
+    A refused or failed write leaves the previous list in place, which the
+    links lists then use.
     """
-    warnings = []
+    warnings, refreshed = [], []
     discord_guild = bot.get_guild(809954021028134943)
-    for guild_name in logic.GUILD_NAMES:
+    for guild_name in guild_names:
         role = discord.utils.get(discord_guild.roles, name=guild_name) if discord_guild else None
         if discord_guild is None:
             problem = "the Discord server isn't available"
@@ -187,7 +189,9 @@ def refresh_discord_rosters():
                 f"{guild_name} -- role list not refreshed",
                 f"{problem}. The lists use the previous one.",
             ))
-    return warnings
+        else:
+            refreshed.append(guild_name)
+    return warnings, refreshed
 
 #export members from the game
 @bot.command(name='members_game')
@@ -197,12 +201,22 @@ async def members_guild(ctx):
     await ctx.send("GP exported")
 
 
-async def export_game_rosters():
+# Held from a roster read to its write, and by the weekly job through
+# GP_databases: a !sync_counters export awaiting Firebase when the 2 AM run
+# starts would otherwise land its older roster in the snapshot.
+roster_export_lock = asyncio.Lock()
+
+
+async def export_game_rosters(guild_names=logic.GUILD_NAMES):
     # The same non-blocking roster read and cached login the invite poll uses.
     # This was pyrebase, which is synchronous and froze the whole bot --
     # the invite poll included -- for the length of the export.
-    for guild_name in logic.GUILD_NAMES:
-        Functions.write_game_roster(guild_name, await fetch_guild_roster(guild_name))
+    for guild_name in guild_names:
+        rows = await fetch_guild_roster(guild_name)
+        problem = logic.validate_roster_rows(rows, Functions.game_roster_size(guild_name))
+        if problem:
+            raise ValueError(f"the {guild_name} roster wasn't saved: {problem}")
+        Functions.write_game_roster(guild_name, rows)
 
 
 #sync counters
@@ -216,15 +230,18 @@ async def sync_counters(ctx, IOguild: str = None):
     if Functions.weekly_job_depth:
         await ctx.send("A weekly run is in progress -- try again once it has finished.")
         return
+    guild_names = [IOguild] if IOguild else list(logic.GUILD_NAMES)
     notes = []
-    try:
-        await export_game_rosters()
-    except Exception as e:
-        notes.append(logic.failure_embed(
-            "In-game roster not refreshed", e,
-            "The in-game lists below are from the previous roster.",
-        ))
-    notes.extend(refresh_discord_rosters())
+    async with roster_export_lock:
+        for guild_name in guild_names:
+            try:
+                await export_game_rosters([guild_name])
+            except Exception as e:
+                notes.append(logic.failure_embed(
+                    f"{guild_name} -- in-game roster not refreshed", e,
+                    f"The {guild_name} in-game lists below are from the previous roster.",
+                ))
+    notes.extend(refresh_discord_rosters(guild_names)[0])
     await send_guild_sections(ctx, IOguild, links_for, "everything is linked.", leading=notes)
 
 
@@ -961,15 +978,19 @@ async def _run_weekly_gp(ack_channel):
     run_key = (await Functions.get_date())["column_name1"]
     await Functions.mark_weekly_run_started(run_key)
 
-    await export_game_rosters()
-    await Functions.GP_databases()
+    async with roster_export_lock:
+        await export_game_rosters()
+        await Functions.GP_databases()
 
     report = []
     failure = None
     try:
         # After the snapshot, not between it and the export: weekly_job()
         # keeps that window short, and GP_databases doesn't read this.
-        report.extend(refresh_discord_rosters())
+        try:
+            report.extend(refresh_discord_rosters()[0])
+        except Exception as e:
+            failure = _record_failure(report, "Role lists not refreshed", e)
         for guild_name in logic.GUILD_NAMES:
             guild_failure = await collect_guild_report(guild_name, report, sync_roles=True)
             if failure is None:
