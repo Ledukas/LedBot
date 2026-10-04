@@ -50,28 +50,6 @@ class TestFilterPersonalGains:
         assert result.empty
 
 
-class TestFindMissing:
-    def test_some_missing(self):
-        assigned = pd.Series([1, 2, 3])
-        actual = pd.Series([2, 3])
-        assert logic.find_missing(assigned, actual).tolist() == [1]
-
-    def test_none_missing(self):
-        assigned = pd.Series([1, 2])
-        actual = pd.Series([1, 2, 3])
-        assert logic.find_missing(assigned, actual).empty
-
-    def test_all_missing(self):
-        assigned = pd.Series([1, 2])
-        actual = pd.Series([], dtype=int)
-        assert logic.find_missing(assigned, actual).tolist() == [1, 2]
-
-    def test_empty_assigned(self):
-        assigned = pd.Series([], dtype=int)
-        actual = pd.Series([1, 2])
-        assert logic.find_missing(assigned, actual).empty
-
-
 class TestInterpretActionResult:
     def test_none_is_failure(self):
         assert logic.interpret_action_result(None, "ok", "fail") == "fail"

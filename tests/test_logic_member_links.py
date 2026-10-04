@@ -150,16 +150,16 @@ class TestFindLinkConflicts:
         assert (characters, accounts) == ([], [])
 
 
-class TestFormatConflicts:
+class TestFormatLinks:
     def test_nothing_to_report_is_none(self):
         """The weekly job's silence depends on this exactly: None means send
         nothing, and only the manual command turns that into a line."""
-        assert logic.format_conflicts([], []) is None
+        assert logic.format_links([], []) is None
 
     def test_a_split_names_both_accounts(self):
         rows = [link(1, 111, "X"), link(2, 222, "X")]
         characters, accounts = logic.find_link_conflicts(rows, {"X": ("Someone", 1)})
-        report = logic.format_conflicts(characters, accounts)
+        report = logic.format_links(characters, accounts)
         assert "111" in report and "222" in report
         assert "!relink" in report
 
@@ -169,7 +169,7 @@ class TestFormatConflicts:
             rows += [link(n * 2, 1000 + n, f"G{n}"), link(n * 2 + 1, 2000 + n, f"G{n}")]
         live = {f"G{n}": (f"character_number_{n}", 1) for n in range(30)}
         characters, accounts = logic.find_link_conflicts(rows, live)
-        report = logic.format_conflicts(characters, accounts)
+        report = logic.format_links(characters, accounts)
         assert len(report) < logic.EMBED_DESCRIPTION_LIMIT
 
     def test_fits_with_both_kinds_at_once(self):
@@ -189,7 +189,7 @@ class TestFormatConflicts:
             live[f"H{n}"] = (f"alt_character_{n}", 1)
         characters, accounts = logic.find_link_conflicts(rows, live)
         assert characters and accounts, "this fixture must produce both kinds"
-        report = logic.format_conflicts(characters, accounts)
+        report = logic.format_links(characters, accounts)
         assert len(report) < logic.EMBED_DESCRIPTION_LIMIT
 
 

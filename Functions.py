@@ -450,8 +450,25 @@ def _load_link_snapshot(IOguild):
     return links, live_characters, live_accounts
 
 
-def conflicts_report(IOguild):
-    """Link rows needing attention, as embeds; [] when there are none.
+def _load_role_holder_labels(IOguild):
+    """{d_id: how the account is named} for the guild role's holders."""
+    return {
+        logic.normalize_discord_id(d_id): logic.account_label(display, discord_name)
+        for d_id, discord_name, display in c.execute(
+            f"SELECT D_ID, Discord, Display FROM {logic.table_name(IOguild, 'discord')}"
+        ).fetchall()
+        if logic.normalize_discord_id(d_id) is not None
+    }
+
+
+def links_report(IOguild, discord_guild=None):
+    """Broken links and who is missing a link, role or character, as embeds;
+    [] when everything is linked.
+
+    Role holders come from {guild}_discord, which the weekly job and
+    !sync_counters refresh. Whether a linked account without the role is still
+    in the server is asked of Discord -- but only once the member cache is
+    complete, since a missing member would otherwise read as having left.
 
     A load failure comes back as an error embed, never as [] -- otherwise a
     crash and a clean week would look identical in the mod channel.
@@ -459,14 +476,18 @@ def conflicts_report(IOguild):
     try:
         links, live_characters, _ = _load_link_snapshot(IOguild)
         character_conflicts, account_conflicts = logic.find_link_conflicts(links, live_characters)
-        unlinked = logic.unlinked_characters(links, live_characters)
+        server = None
+        if discord_guild is not None and discord_guild.chunked:
+            server = _resolve_role_holders(discord_guild, IOguild, {
+                row['d_id'] for row in logic.usable_links(links) if row['g_id'] in live_characters
+            })
+        gaps = logic.link_gaps(links, live_characters, _load_role_holder_labels(IOguild), server)
         return logic.section_embeds(
-            IOguild, "link conflicts",
-            logic.format_conflicts(character_conflicts, account_conflicts, unlinked),
+            IOguild, "links", logic.format_links(character_conflicts, account_conflicts, gaps),
         )
     except Exception as e:
         print("line: " + str(inspect.currentframe().f_lineno) + "\n error: " + str(e))
-        return [logic.failure_embed(f"{IOguild} -- link conflicts failed", e)]
+        return [logic.failure_embed(f"{IOguild} -- links failed", e)]
 
 
 def _recent_gains(IOguild, g_ids):
@@ -638,10 +659,10 @@ async def whois(channel, term, discord_guild=None):
 def _resolve_role_holders(discord_guild, IOguild, d_ids):
     """Who still holds the guild role, asked of Discord rather than the database.
 
-    {guild}_discord is rebuilt only by !members_discord and !sync_counters,
-    both manual, so it can be weeks stale -- reading it would answer this
-    question from a snapshot nobody has refreshed. GP_roles and the giveaway
-    cog already resolve membership this way.
+    {guild}_discord is rebuilt only weekly and by !members_discord and
+    !sync_counters, so it can be days stale -- reading it would answer this
+    question from an old snapshot. GP_roles and the giveaway cog already
+    resolve membership this way.
 
     A Discord id missing from the member cache is left out entirely rather than
     reported as absent, so the report can say "unknown" instead of guessing.
@@ -1101,8 +1122,8 @@ async def promotions(bot, channel):
 def _ensure_game_table(table):
     """Create {guild}_game with the schema pandas' to_sql originally gave it.
 
-    The shape matters beyond tidiness: assign and sync_counters read this table
-    with SELECT * and index the columns by position.
+    The shape matters beyond tidiness: assign reads this table with SELECT *
+    and indexes the columns by position.
     """
     c.execute(
         f'CREATE TABLE IF NOT EXISTS "{table}" '
@@ -1136,6 +1157,45 @@ def write_game_roster(IOguild, rows, from_poll=False):
         raise
     if not from_poll:
         roster_generation += 1
+
+
+def _ensure_discord_table(table):
+    """Create {guild}_discord with the schema pandas' to_sql originally gave it."""
+    c.execute(
+        f'CREATE TABLE IF NOT EXISTS "{table}" '
+        '("index" INTEGER, "Discord" TEXT, "D_ID" INTEGER, "Display" TEXT)'
+    )
+    c.execute(f'CREATE INDEX IF NOT EXISTS "ix_{table}_index" ON "{table}" ("index")')
+
+
+def write_discord_roster(IOguild, rows):
+    """Replace {guild}_discord with `rows` in a single transaction -- the
+    to_sql(if_exists='replace') it used to be autocommits its DROP and CREATE
+    separately, which write_game_roster explains."""
+    table = logic.table_name(IOguild, 'discord')
+    _ensure_discord_table(table)
+    try:
+        c.execute(f'DELETE FROM "{table}"')
+        c.executemany(
+            f'INSERT INTO "{table}" ("index", "Discord", "D_ID", "Display") VALUES (?, ?, ?, ?)',
+            [(position, row['Discord'], row['D_ID'], row['Display']) for position, row in enumerate(rows)],
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def refresh_discord_roster(IOguild, rows):
+    """Write a freshly read role list unless it looks like a partial read.
+    Returns why it was refused, or None once written."""
+    table = logic.table_name(IOguild, 'discord')
+    _ensure_discord_table(table)
+    current = c.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
+    problem = logic.validate_discord_rows(rows, current)
+    if problem is None:
+        write_discord_roster(IOguild, rows)
+    return problem
 
 
 def refresh_game_roster(IOguild, rows, generation):

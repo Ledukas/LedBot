@@ -156,14 +156,17 @@ def realistic_week():
         [(4, f"busy_member_{i}", [900, 760, 680, 1200, 900, 680, 800, 690]) for i in range(4)],
         [(1500, "busy_member_0")],
     ))
-    embeds += logic.section_embeds("Aetherians", "link conflicts", logic.format_conflicts(
-        [], [], [(f"unlinked_{i}", f"U{i:025d}") for i in range(3)]
+    embeds += logic.section_embeds("Aetherians", "links", logic.format_links(
+        [], [], {'game_no_link': [f"unlinked_{i}" for i in range(3)],
+                 'role_no_link': [f"discord_member_{i}" for i in range(3)]}
     ))
     embeds += logic.format_red_gp("Pretherians", red_frame(
         [(f"preth_member_{i:02d}", f"P{i}", 180, 150, 60, i) for i in range(14)], "Pretherians"
     ))
-    embeds += logic.section_embeds("Pretherians", "link conflicts", logic.format_conflicts(
-        [], [], [(f"unlinked_{i}", f"V{i:025d}") for i in range(5)]
+    embeds += logic.section_embeds("Pretherians", "links", logic.format_links(
+        [], [], {'game_no_link': [f"unlinked_{i}" for i in range(5)],
+                 'role_no_link': [f"discord_member_{i}" for i in range(5)],
+                 'role_no_character': ["left_a", "left_b"]}
     ))
     return embeds
 
@@ -209,7 +212,7 @@ class TestFinishWeeklyReport:
 
 class TestBuilders:
     def test_a_missing_table_is_an_error_embed_not_silence(self, temp_functions_db):
-        for build in (Functions.gp_audit_report, Functions.conflicts_report):
+        for build in (Functions.gp_audit_report, Functions.links_report):
             [embed] = build("Aetherians")
             assert embed.colour.value == logic.ERROR_COLOR
             assert "failed" in embed.title
@@ -228,9 +231,10 @@ class TestBuilders:
             raise ValueError("unexpected value")
         monkeypatch.setattr(Functions, "_load_gp_series", lambda guild: {})
         monkeypatch.setattr(Functions, "_load_link_snapshot", lambda guild: ([], {}, {}))
+        monkeypatch.setattr(Functions, "_load_role_holder_labels", lambda guild: {})
         monkeypatch.setattr(logic, "format_gp_audit", broken)
-        monkeypatch.setattr(logic, "format_conflicts", broken)
-        for build in (Functions.gp_audit_report, Functions.conflicts_report):
+        monkeypatch.setattr(logic, "format_links", broken)
+        for build in (Functions.gp_audit_report, Functions.links_report):
             [embed] = build("Aetherians")
             assert embed.colour.value == logic.ERROR_COLOR
 
@@ -283,8 +287,14 @@ def weekly(temp_functions_db, no_bot_run, monkeypatch, tmp_path):
     async def get_date(today=None):
         return {"column_name1": WEEK}
 
-    async def nothing(*args, **kwargs):
-        calls.append("export/GP_databases")
+    def step(name):
+        async def stub(*args, **kwargs):
+            calls.append(name)
+        return stub
+
+    def refresh_discord_rosters():
+        calls.append("refresh_discord")
+        return list(state.discord_warnings)
 
     async def gp_dataframe(guild, today=None):
         state.dataframe_days.append(today)
@@ -295,24 +305,27 @@ def weekly(temp_functions_db, no_bot_run, monkeypatch, tmp_path):
 
     def build(kind):
         def builder(*args):
-            guild = args[-1]
+            guild = next(arg for arg in args if arg in logic.GUILD_NAMES)
             calls.append(f"{kind}:{guild}")
             return state.sections.get(f"{kind}:{guild}", [])
         return builder
 
-    state = SimpleNamespace(mod=mod, calls=calls, sections={}, dataframe_days=[], module=LedBotCode)
+    state = SimpleNamespace(
+        mod=mod, calls=calls, sections={}, dataframe_days=[], discord_warnings=[], module=LedBotCode,
+    )
     monkeypatch.setattr(LedBotCode, "LedukasSpam_channel", mod)
     monkeypatch.setattr(LedBotCode, "LedukasSpam_channelID", MOD_CHANNEL_ID)
-    monkeypatch.setattr(LedBotCode, "export_game_rosters", nothing)
+    monkeypatch.setattr(LedBotCode, "export_game_rosters", step("export"))
+    monkeypatch.setattr(LedBotCode, "refresh_discord_rosters", refresh_discord_rosters)
     monkeypatch.setattr(LedBotCode, "run_backup", lambda: Path("Backups/Database_2026_10_03.db"))
     monkeypatch.setattr(Functions, "get_date", get_date)
-    monkeypatch.setattr(Functions, "GP_databases", nothing)
+    monkeypatch.setattr(Functions, "GP_databases", step("GP_databases"))
     monkeypatch.setattr(Functions, "GP_dataframe", gp_dataframe)
     monkeypatch.setattr(Functions, "GP_roles", gp_roles)
     monkeypatch.setattr(Functions, "snapshot_taken", lambda column: True)
     monkeypatch.setattr(Functions, "red_gp_report", build("red"))
     monkeypatch.setattr(Functions, "gp_audit_report", build("audit"))
-    monkeypatch.setattr(Functions, "conflicts_report", build("conflicts"))
+    monkeypatch.setattr(Functions, "links_report", build("links"))
     return state
 
 
@@ -336,12 +349,12 @@ class TestWeeklyRun:
 
     def test_a_red_list_week_is_one_message_with_the_backup_in_the_footer(self, weekly):
         weekly.sections["red:Aetherians"] = section("Aetherians -- red GP (40)")
-        weekly.sections["conflicts:Pretherians"] = section("Pretherians -- link conflicts")
+        weekly.sections["links:Pretherians"] = section("Pretherians -- links")
         run(weekly)
         [(content, kwargs)] = weekly.mod.sent
         assert content == "**Weekly report -- week ending 10/3**"
         titles = [embed.title for embed in kwargs['embeds']]
-        assert titles == ["Aetherians -- red GP (40)", "Pretherians -- link conflicts"]
+        assert titles == ["Aetherians -- red GP (40)", "Pretherians -- links"]
         assert kwargs['embeds'][-1].footer.text == "Backup: Database_2026_10_03.db"
         assert kwargs['allowed_mentions'].everyone is False
 
@@ -374,8 +387,8 @@ class TestWeeklyRun:
         with pytest.raises(weekly.module.WeeklyReportIncomplete):
             run(weekly)
         assert "red:Aetherians" not in weekly.calls
-        for step in ("audit:Aetherians", "conflicts:Aetherians",
-                     "red:Pretherians", "audit:Pretherians", "conflicts:Pretherians"):
+        for step in ("audit:Aetherians", "links:Aetherians",
+                     "red:Pretherians", "audit:Pretherians", "links:Pretherians"):
             assert step in weekly.calls
         [embed] = weekly.mod.sent[0][1]['embeds']
         assert embed.title == "Aetherians -- GP table failed, rank roles not synced"
@@ -447,6 +460,63 @@ class TestWeeklyRun:
         assert elsewhere.sent == []
 
 
+class TestDiscordRefreshInTheWeeklyRun:
+    def test_it_runs_after_the_snapshot_and_before_the_sections(self, weekly):
+        """Not between the export and GP_databases: weekly_job() keeps that
+        window short, and the snapshot doesn't read the role list."""
+        run(weekly)
+        calls = weekly.calls
+        assert calls.index("GP_databases") < calls.index("refresh_discord") < calls.index("red:Aetherians")
+
+    def test_its_warnings_open_the_report(self, weekly):
+        weekly.discord_warnings = [logic.warning_embed("Aetherians -- role list not refreshed", "x")]
+        weekly.sections["links:Aetherians"] = section("Aetherians -- links")
+        run(weekly)
+        titles = [embed.title for embed in weekly.mod.sent[0][1]['embeds']]
+        assert titles == ["Aetherians -- role list not refreshed", "Aetherians -- links"]
+
+
+class TestSyncCounters:
+    def test_refreshes_both_sides_then_posts_one_message(self, weekly):
+        weekly.sections["links:Aetherians"] = section("Aetherians -- links")
+        here = FakeChannel(channel_id=1)
+        asyncio.run(weekly.module.sync_counters.callback(FakeContext(here), None))
+        assert weekly.calls[:2] == ["export", "refresh_discord"]
+        [(content, kwargs)] = here.sent
+        assert content == "Pretherians: everything is linked."
+        assert [embed.title for embed in kwargs['embeds']] == ["Aetherians -- links"]
+
+    def test_a_failed_export_says_the_game_side_is_old_and_still_posts(self, weekly, monkeypatch):
+        async def down():
+            raise RuntimeError("Firebase unavailable")
+        monkeypatch.setattr(weekly.module, "export_game_rosters", down)
+        weekly.sections["links:Pretherians"] = section("Pretherians -- links")
+        here = FakeChannel(channel_id=1)
+        asyncio.run(weekly.module.sync_counters.callback(FakeContext(here), None))
+        [(_, kwargs)] = here.sent
+        failure, links = kwargs['embeds']
+        assert failure.title == "In-game roster not refreshed"
+        assert "previous roster" in failure.description
+        assert links.title == "Pretherians -- links"
+        assert "refresh_discord" in weekly.calls
+
+    def test_refused_while_a_weekly_run_is_going(self, weekly, monkeypatch):
+        """It writes {guild}_game, which the weekly job reads between its
+        export and GP_databases."""
+        monkeypatch.setattr(Functions, "weekly_job_depth", 1)
+        here = FakeChannel(channel_id=1)
+        asyncio.run(weekly.module.sync_counters.callback(FakeContext(here), None))
+        [(content, _)] = here.sent
+        assert content.startswith("A weekly run is in progress")
+        assert weekly.calls == []
+
+    def test_an_unknown_guild_is_refused_before_refreshing(self, weekly):
+        here = FakeChannel(channel_id=1)
+        asyncio.run(weekly.module.sync_counters.callback(FakeContext(here), "aetherians"))
+        assert here.sent[0][0].startswith("Unknown guild")
+        assert weekly.calls == []
+
+
 class TestFailureAdvice:
     """A failure inside the report is not answered with a re-run: the snapshot
     is already taken, and re-running overwrites it with later totals."""
@@ -473,7 +543,7 @@ class TestFailureAdvice:
         here = FakeChannel(channel_id=1)
         asyncio.run(weekly.module.GP_weekly_man.callback(FakeContext(here)))
         assert [content for content, _ in here.sent] == ["A weekly run is already in progress."]
-        assert "export/GP_databases" not in weekly.calls
+        assert "export" not in weekly.calls and "GP_databases" not in weekly.calls
 
 
 class TestInterruptedRun:
@@ -514,7 +584,7 @@ class TestManualReports:
         [(content, kwargs)] = here.sent
         assert content == "**Report preview -- week ending 10/3**"
         assert kwargs['embeds'][0].footer.text is None
-        assert "export/GP_databases" not in weekly.calls
+        assert "export" not in weekly.calls and "GP_databases" not in weekly.calls
 
     def test_the_preview_before_the_saturday_run_shows_last_week(self, weekly, monkeypatch):
         monkeypatch.setattr(Functions, "get_date", REAL_GET_DATE)
@@ -537,8 +607,8 @@ class TestManualReports:
     def test_conflicts_for_one_clean_guild(self, weekly):
         here = FakeChannel(channel_id=1)
         asyncio.run(weekly.module.conflicts.callback(FakeContext(here), "Pretherians"))
-        assert here.sent == [("Pretherians: no link conflicts found.", here.sent[0][1])]
-        assert weekly.calls == ["conflicts:Pretherians"]
+        assert here.sent == [("Pretherians: everything is linked.", here.sent[0][1])]
+        assert weekly.calls == ["links:Pretherians"]
 
     def test_an_unknown_guild_is_refused_before_anything_runs(self, weekly):
         here = FakeChannel(channel_id=1)

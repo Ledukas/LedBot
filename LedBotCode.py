@@ -154,22 +154,40 @@ async def export_data(ctx):
 @bot.command(name='members_discord')
 @commands.has_role("Moderator")
 async def members_discord(ctx):
-    for guild_name in guilds_data.keys():     
-        guild = ctx.guild # discord guild = server
-        role = discord.utils.get(guild.roles, name=guild_name) # IOguild = IdleOnGuild. Must have a matching role name
-        if role is None:
-            await ctx.send(f"Role '{guild_name}' not found")
-            return
-        members = role.members
-        role_members = [member for member in members if role in member.roles]
-        data = {'Discord': [member.name + '#' + member.discriminator for member in role_members], 
-                'D_ID': [int(member.id) for member in role_members],
-                'Display': [member.display_name for member in role_members],}
-        df = pd.DataFrame(data)
-        # store the data in a database
-        df.to_sql(logic.table_name(guild_name, 'discord'), conn, if_exists='replace')
-        conn.commit()
-    await ctx.send("Discord members exported")
+    warnings = refresh_discord_rosters()
+    if warnings:
+        await send_embeds(ctx, warnings)
+    else:
+        await ctx.send("Discord members exported")
+
+
+def refresh_discord_rosters():
+    """Save who holds each guild role into {guild}_discord.
+
+    Returns warning embeds for anything not refreshed. A refused or failed
+    write leaves the previous list in place, which the links lists then use.
+    """
+    warnings = []
+    discord_guild = bot.get_guild(809954021028134943)
+    for guild_name in logic.GUILD_NAMES:
+        role = discord.utils.get(discord_guild.roles, name=guild_name) if discord_guild else None
+        if discord_guild is None:
+            problem = "the Discord server isn't available"
+        elif role is None:
+            problem = f"there is no '{guild_name}' role"
+        else:
+            try:
+                problem = Functions.refresh_discord_roster(
+                    guild_name, logic.discord_roster_rows(role.members)
+                )
+            except Exception as e:
+                problem = f"{type(e).__name__}: {e}"
+        if problem:
+            warnings.append(logic.warning_embed(
+                f"{guild_name} -- role list not refreshed",
+                f"{problem}. The lists use the previous one.",
+            ))
+    return warnings
 
 #export members from the game
 @bot.command(name='members_game')
@@ -190,112 +208,30 @@ async def export_game_rosters():
 #sync counters
 @bot.command(name='sync_counters')
 @commands.has_role("Moderator")
-async def sync_counters(ctx):
-    await members_discord(ctx)
-    await members_guild(ctx)
-    
-    for guild_name in guilds_data.keys():  
-    
-        table_name_members = logic.table_name(guild_name, 'members')
-        table_name_discord = logic.table_name(guild_name, 'discord')
-        table_name_game = logic.table_name(guild_name, 'game')
+async def sync_counters(ctx, IOguild: str = None):
+    """Refresh the in-game roster and who holds the guild roles, then show
+    what needs linking. !conflicts shows the same without refreshing."""
+    if await reject_unknown_guild(ctx, IOguild):
+        return
+    if Functions.weekly_job_depth:
+        await ctx.send("A weekly run is in progress -- try again once it has finished.")
+        return
+    notes = []
+    try:
+        await export_game_rosters()
+    except Exception as e:
+        notes.append(logic.failure_embed(
+            "In-game roster not refreshed", e,
+            "The in-game lists below are from the previous roster.",
+        ))
+    notes.extend(refresh_discord_rosters())
+    await send_guild_sections(ctx, IOguild, links_for, "everything is linked.", leading=notes)
 
-        # Discord names for assigning
-        with open('sync.txt', 'w') as f:
-            f.write(f'*{guild_name}*\n')
-            f.write('*Discord display names:\n')
-        c = conn.cursor()
-        try:
-            c.execute('SELECT * FROM '+table_name_discord)
-            rows = c.fetchall()
-        except Exception as e:
-            print("line: " + str(inspect.currentframe().f_lineno) + "\n error: " + str(e))
-            await ctx.send(f"Could not read {table_name_discord}: {e}")
-            return
-        sync_discord_list = []
-        for row in rows:
-            try:
-                value = row[2]
-                results = c.execute('SELECT * FROM ' + table_name_members + ' WHERE D_ID = ?', (value,))
-                if results.fetchone() == None:
-                    sync_discord = row[3] + ", " + str(row[2])
-                    sync_discord_list.append(sync_discord)
-            except Exception as e:
-                print("line: " + str(inspect.currentframe().f_lineno) + "\n error: " + str(e))
-        with open('sync.txt', 'a') as f:
-            for item in sync_discord_list: 
-                try:
-                    f.write(str(item)+'\n')
-                except Exception as e:
-                    print("line: " + str(inspect.currentframe().f_lineno) + "\n error: " + str(e))
 
-        # Game names for assigning
-        try:
-            with open('sync.txt', 'a') as f:
-                f.write('\n*In-game names:\n')
-        except Exception as e:
-                    print("line: " + str(inspect.currentframe().f_lineno) + "\n error: " + str(e))
-        c.execute('SELECT * FROM '+table_name_game) 
-        rows = c.fetchall()
-        kickable_list = []
-        for row in rows:
-            value = row[2]
-            results = c.execute('SELECT * FROM ' + table_name_members + ' WHERE G_ID = ?', (value,))
-            if results.fetchone() == None:
-                kickable = row[1]
-                kickable_list.append(kickable)
-        with open('sync.txt', 'a') as f:
-            for item in kickable_list: 
-                f.write(str(item)+'\n')
+def links_for(guild_name):
+    return Functions.links_report(guild_name, bot.get_guild(809954021028134943))
 
-        # Preparing the dataframes for further comparison
-        df_list = pd.read_sql_query("SELECT * FROM " + table_name_members, conn) # df_list- data from members table
-        df_list_discord = df_list.loc[:, "D_ID"]
-        df_list_game = df_list.loc[:, "G_ID"]
-        df_discord = pd.read_sql_query("SELECT * FROM "+ table_name_discord, conn)
-        df_discord = df_discord.loc[:, "D_ID"]
-        df_game = pd.read_sql_query("SELECT * FROM "+ table_name_game, conn)
-        df_game = df_game.loc[:, "G_ID"]
 
-        # Game names, assigned but not in discord
-        with open('sync.txt', 'a') as f:
-            f.write('\n*Assigned but not in discord:\n')
-        df_assigned_notindisocrd = logic.find_missing(df_list_discord, df_discord)
-        for value in df_assigned_notindisocrd:
-            temp = c.execute('SELECT G_ID FROM ' + table_name_members + ' WHERE D_ID = ?', (value,))
-            game_id = c.fetchall()
-            for value in game_id: 
-                temp = c.execute('SELECT G_NAME from ' + table_name_game + ' WHERE G_ID =?', value)
-                game_name = c.fetchall()
-                for item in game_name:
-                    with open('sync.txt', 'a') as f:
-                        f.write(str(item)+'\n')
-
-        # Discord accounts, assigned but not in game
-        with open('sync.txt', 'a') as f:
-            f.write('\n*Assigned but not in game:\n')
-        df_assigned_notingame = logic.find_missing(df_list_game, df_game)
-        for value in df_assigned_notingame:
-            try:
-                temp = c.execute('SELECT D_ID FROM ' + table_name_members + ' WHERE G_ID = ?', (value,))
-                discord_id = c.fetchall()
-            except Exception as e:
-                print("line: " + str(inspect.currentframe().f_lineno) + "\n error: " + str(e))
-                continue
-            for value in discord_id:
-                temp = c.execute('SELECT Display from ' + table_name_discord + ' WHERE D_ID = ?', value)
-                discord_name = c.fetchall()
-                for item in discord_name:
-                    with open('sync.txt', 'a') as f:
-                        f.write(str(item)+'\n')
-
-        file = discord.File("sync.txt")
-        await ctx.send(file=file)
-
-        c.close()
-        os.remove("sync.txt")
-    await ctx.send("Sync files generated")
-    
 #assign members in-game and discord
 @bot.command(name='assign')
 @commands.has_role("Moderator")
@@ -874,8 +810,9 @@ async def whois(ctx, *, term: str = None):
 @bot.command(name='conflicts')
 @commands.has_role("Moderator")
 async def conflicts(ctx, IOguild: str = None):
-    """Link rows that need attention. Also runs as part of the weekly cycle."""
-    await send_guild_sections(ctx, IOguild, Functions.conflicts_report, "no link conflicts found.")
+    """What needs linking, from the last refresh. Also part of the weekly report;
+    !sync_counters refreshes first."""
+    await send_guild_sections(ctx, IOguild, links_for, "everything is linked.")
 
 @bot.command(name='relink')
 @commands.has_role("Moderator")
@@ -938,14 +875,20 @@ async def gp_audit(ctx, IOguild: str = None):
     await send_guild_sections(ctx, IOguild, Functions.gp_audit_report, "nobody flagged.")
 
 
-async def send_guild_sections(ctx, IOguild, build, clean_text):
-    """One reply for a per-guild report command: embeds for the guilds with
-    something to report, a line for each that has nothing."""
+async def reject_unknown_guild(ctx, IOguild):
     if IOguild is not None and IOguild not in logic.GUILD_NAMES:
         await ctx.send(f"Unknown guild '{IOguild}'. Pick one of: {', '.join(logic.GUILD_NAMES)}")
+        return True
+    return False
+
+
+async def send_guild_sections(ctx, IOguild, build, clean_text, leading=()):
+    """One reply for a per-guild report command: embeds for the guilds with
+    something to report, a line for each that has nothing."""
+    if await reject_unknown_guild(ctx, IOguild):
         return
 
-    embeds, clean = [], []
+    embeds, clean = list(leading), []
     for guild_name in ([IOguild] if IOguild else logic.GUILD_NAMES):
         section = build(guild_name)
         embeds.extend(section)
@@ -1024,6 +967,9 @@ async def _run_weekly_gp(ack_channel):
     report = []
     failure = None
     try:
+        # After the snapshot, not between it and the export: weekly_job()
+        # keeps that window short, and GP_databases doesn't read this.
+        report.extend(refresh_discord_rosters())
         for guild_name in logic.GUILD_NAMES:
             guild_failure = await collect_guild_report(guild_name, report, sync_roles=True)
             if failure is None:
@@ -1100,7 +1046,7 @@ async def collect_guild_report(guild_name, report, sync_roles, today=None):
                     ))
         report.extend(Functions.red_gp_report(monthly_gp_df, guild_name))
     report.extend(Functions.gp_audit_report(guild_name))
-    report.extend(Functions.conflicts_report(guild_name))
+    report.extend(links_for(guild_name))
     return failure
 
 

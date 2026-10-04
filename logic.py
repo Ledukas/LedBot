@@ -445,8 +445,9 @@ def warning_embed(title: str, text: str) -> discord.Embed:
     return report_embed(title, text, WARNING_COLOR)
 
 
-def failure_embed(title: str, error: BaseException) -> discord.Embed:
-    return report_embed(title, f"{type(error).__name__}: {error}", ERROR_COLOR)
+def failure_embed(title: str, error: BaseException, note: str | None = None) -> discord.Embed:
+    text = f"{type(error).__name__}: {error}"
+    return report_embed(title, f"{text}\n{note}" if note else text, ERROR_COLOR)
 
 
 def section_embeds(io_guild: str, section: str, body: str | None) -> list[discord.Embed]:
@@ -739,8 +740,8 @@ def find_link_conflicts(
 
     Deliberately takes no set of live Discord accounts. None of the conflicts
     below needs one, which is what makes this immune to {guild}_discord being
-    stale -- that table is rebuilt only by !members_discord and !sync_counters,
-    both manual, so it can be weeks out of date.
+    stale -- that table is rebuilt only weekly and by !members_discord and
+    !sync_counters, so it can be days out of date.
 
     Rows for a character that has left the guild are not conflicts. They are
     the only record of who was once linked to what, and Functions.GP_roles
@@ -817,8 +818,9 @@ def character_name(entry) -> str | None:
 # what makes that safe regardless of how long the names in them turn out to be.
 # One budget for the whole report, not one per block: two blocks each sized
 # against the limit add up to twice the limit, and the headings, fences and
-# "...and N more" lines are on top of that again.
-CONFLICT_REPORT_BUDGET = 3500
+# "...and N more" lines are on top of that again -- with all eight blocks of
+# the links section collapsing to counts at once, about 900 characters of them.
+CONFLICT_REPORT_BUDGET = 3000
 
 
 def _fit_entries(entries: list[list[str]], budget: int) -> tuple[list[str], int]:
@@ -840,39 +842,123 @@ def _fit_entries(entries: list[list[str]], budget: int) -> tuple[list[str], int]
     return lines, 0
 
 
-def unlinked_characters(link_rows: list[dict], live_characters: dict) -> list[tuple]:
-    """(name, g_id) for every in-game character with no usable link row.
+def account_label(display: str | None, discord_name: str | None) -> str:
+    """How a Discord account is named in the links lists: the display name,
+    plus the username when it differs -- !assign matches either, and a
+    username never needs quoting. Usernames are stored as 'name#0' (or a
+    legacy 'name#1234'); the discriminator isn't part of what !assign matches."""
+    username = re.sub(r"#\d{1,4}$", "", discord_name or "")
+    if not display:
+        return username or "?"
+    if username and username.casefold() != display.casefold():
+        return f"{display} ({username})"
+    return display
 
-    These are the members who joined and were never assigned -- the gap the
-    invite auto-link exists to close, and the backstop for anyone who accepts
-    an invite after the bot has stopped watching for it. A row with a game id
-    but no usable Discord id still counts as unlinked: nobody is attached to it.
+
+def _names_sorted(names) -> list[str]:
+    return sorted(names, key=str.casefold)
+
+
+def link_gaps(
+    link_rows: list[dict],
+    live_characters: dict,
+    role_holders: dict,
+    server: dict | None = None,
+) -> dict[str, list[str]]:
+    """Who is missing a link, a role, or a character, as named lists.
+
+    `role_holders` maps the guild role's holders (from {guild}_discord) to how
+    they are named. `server` is {d_id: holds the role} for linked accounts that
+    are in the Discord server right now, asked of Discord; anyone absent from
+    it has left. Without it, "linked but without the role" can't say which of
+    the two it is, so it is one combined list read from `role_holders`.
+
+    A character counts as having the role when any of its linked accounts
+    does -- with a split, one holder is enough. "Has the role, no character in
+    game" means none of the holder's linked characters is in the guild: the old
+    sync_counters query matched any departed link row, so a member with one old
+    and one current character was listed wrongly.
     """
-    linked = {row['g_id'] for row in usable_links(link_rows)}
-    return sorted(
-        (character_name(entry) or g_id, g_id)
-        for g_id, entry in live_characters.items()
-        if g_id not in linked
-    )
+    usable = usable_links(link_rows)
+    linked_g_ids = {row['g_id'] for row in usable}
+    linked_d_ids = {row['d_id'] for row in usable}
+    accounts_in_game = {row['d_id'] for row in usable if row['g_id'] in live_characters}
+
+    rows_by_character: dict[str, list[dict]] = {}
+    for row in usable:
+        if row['g_id'] in live_characters:
+            rows_by_character.setdefault(row['g_id'], []).append(row)
+
+    def holds_role(d_id):
+        return server.get(d_id, False) if server is not None else d_id in role_holders
+
+    in_server, left, without_role = [], [], []
+    for g_id, rows in rows_by_character.items():
+        if any(holds_role(row['d_id']) for row in rows):
+            continue
+        name = character_name(live_characters[g_id]) or g_id
+        if server is None:
+            without_role.append(name)
+            continue
+        present = [row for row in rows if row['d_id'] in server]
+        if present:
+            account = account_label(present[0].get('display'), present[0].get('discord'))
+            in_server.append(f"{name}  ({account})")
+        else:
+            left.append(name)
+
+    return {
+        'role_no_link': _names_sorted(
+            label for d_id, label in role_holders.items() if d_id not in linked_d_ids
+        ),
+        'game_no_link': _names_sorted(
+            character_name(entry) or g_id
+            for g_id, entry in live_characters.items() if g_id not in linked_g_ids
+        ),
+        'no_role_in_server': _names_sorted(in_server),
+        'no_role_left': _names_sorted(left),
+        'no_role': _names_sorted(without_role),
+        'role_no_character': _names_sorted(
+            label for d_id, label in role_holders.items()
+            if d_id in linked_d_ids and d_id not in accounts_in_game
+        ),
+    }
 
 
-def format_conflicts(
+LINK_GAP_SECTIONS = (
+    ('role_no_link', "Has the role, no link:"),
+    ('game_no_link', "In game, no link:"),
+    ('no_role_in_server', "Linked, in the server without the role:"),
+    ('no_role_left', "Linked, but left the Discord server:"),
+    ('no_role', "Linked, but without the role:"),
+    ('role_no_character', "Has the role, no character in game:"),
+)
+
+
+def _code_safe(text: str) -> str:
+    """A Discord display name can contain a code fence, which would end the block."""
+    return text.replace("```", "'''")
+
+
+def format_links(
     character_conflicts: list[dict],
     account_conflicts: list[dict],
-    unlinked: list[tuple] = (),
+    gaps: dict | None = None,
     budget: int = CONFLICT_REPORT_BUDGET,
 ) -> str | None:
-    """One guild's conflict report, or None when there is nothing to report.
+    """One guild's links section, or None when there is nothing to report.
 
     Returning None rather than a "nothing found" string is what lets the weekly
-    job stay silent while the manual command still confirms it ran: whether
-    there is anything to say is a fact about the data and belongs here, but
-    what silence *means* depends on who asked, so the caller decides that.
+    job leave the section out while the manual command still confirms it ran:
+    whether there is anything to say is a fact about the data and belongs here,
+    but what silence *means* depends on who asked, so the caller decides that.
 
-    Entries are sorted worst-first, so when the budget truncates the report it
-    is always the least urgent ones that fall off the end.
+    Harmful conflicts come first and every block shares one budget, so when the
+    budget truncates the report it is always the least urgent lists that
+    collapse to a count.
     """
-    if not character_conflicts and not account_conflicts and not unlinked:
+    gaps = gaps or {}
+    if not character_conflicts and not account_conflicts and not any(gaps.values()):
         return None
 
     lines = []
@@ -916,12 +1002,12 @@ def format_conflicts(
             "but !mygains and !kick will pick one arbitrarily):",
         )
 
-    if unlinked:
-        entries = [[f"{name}  ({g_id})"] for name, g_id in unlinked]
-        _append_section(
-            lines, entries, remaining, "character(s)",
-            "In game with no Discord account linked (!assign them, or check with !whois):",
-        )
+    for key, heading in LINK_GAP_SECTIONS:
+        names = gaps.get(key)
+        if names:
+            remaining = _append_section(
+                lines, [[_code_safe(name)] for name in names], remaining, "name(s)", heading
+            )
 
     return "\n".join(lines)
 
@@ -1733,6 +1819,35 @@ def validate_roster_rows(rows: list[dict], current_count: int) -> str | None:
     return None
 
 
+def discord_roster_rows(members) -> list[dict]:
+    """{guild}_discord rows for the guild role's members, in the shape
+    !members_discord has always written."""
+    return [
+        {
+            'Discord': f"{member.name}#{member.discriminator}",
+            'D_ID': int(member.id),
+            'Display': member.display_name,
+        }
+        for member in members
+    ]
+
+
+def validate_discord_rows(rows: list[dict], current_count: int) -> str | None:
+    """Why a freshly read role list must not replace {guild}_discord, or None.
+
+    An empty or halved list is far likelier to be a cold member cache than an
+    exodus, and writing it would list everyone as linked but without the role
+    and tell every member !mygains has nothing for them.
+    """
+    if not rows:
+        return "nobody holds the role"
+    if any(normalize_discord_id(row.get('D_ID')) is None for row in rows):
+        return "a member has no Discord id"
+    if current_count and len(rows) * 2 < current_count:
+        return f"the role list shrank from {current_count} to {len(rows)} members"
+    return None
+
+
 WELCOME_TEXT = (
     "{member} Welcome to the guild!\n"
     "Our guild's home world is Skull 1, so please switch to it and set it as a favorite!\n"
@@ -2007,14 +2122,6 @@ def filter_personal_gains(df: pd.DataFrame, g_id) -> pd.DataFrame:
     """Rows for a single G_ID, with the G_ID column dropped."""
     filtered = df[df['G_ID'] == g_id]
     return filtered.drop('G_ID', axis=1)
-
-
-def find_missing(assigned: pd.Series, actual: pd.Series) -> pd.Series:
-    """Values in assigned that don't appear in actual. Used for both the
-    'assigned but not in discord' and 'assigned but not in game' diffs in
-    sync_counters, which used to repeat this exact expression twice.
-    """
-    return assigned.loc[~assigned.isin(actual)]
 
 
 def interpret_action_result(result_value: str | None, success_msg: str, failure_msg: str) -> str:

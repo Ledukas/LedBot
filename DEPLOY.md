@@ -15,7 +15,7 @@ Then place the two secret files in the repo root (never committed — see `.giti
 
 The three welcome-channel ids in `.env` (`WELCOME_POST_CHANNEL_ID`, `WELCOME_INFO_CHANNEL_ID`, `ROLES_CHANNEL_ID`) are optional: without them the bot still starts, and the invite auto-link still links members and gives roles, but skips the welcome post and says so in the mod channel. Add them when updating an existing Pi.
 
-The weekly report is posted as embeds, so the bot needs the **Embed Links** permission in the mod channel (and wherever `!gp_audit`, `!conflicts` or `!weekly_report` are used). Without it the bot posts a line saying so instead of the report.
+The weekly report is posted as embeds, so the bot needs the **Embed Links** permission in the mod channel (and wherever `!gp_audit`, `!conflicts`, `!sync_counters` or `!weekly_report` are used). Without it the bot posts a line saying so instead of the report.
 
 ## Installing the systemd unit
 

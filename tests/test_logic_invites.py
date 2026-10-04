@@ -534,38 +534,3 @@ class TestInviteMessages:
         linked = invite(1, "Bob", status=logic.INVITE_LINKED)
         linked.update(matched_name="Bob", matched_g_id="X")
         assert "!relink" in logic.format_uninvite(GUILD, linked)
-
-
-class TestConflictReportUnlinkedSection:
-    def test_unlinked_characters_alone_make_a_report(self):
-        text = logic.format_conflicts([], [], [("KingBob531", "X")])
-        assert "KingBob531" in text
-
-    def test_nothing_at_all_is_still_none(self):
-        """The weekly job's silence depends on this."""
-        assert logic.format_conflicts([], [], []) is None
-
-    def test_unlinked_characters_come_from_usable_links(self):
-        live = {"X": ("Linked", 1), "Y": ("NoAccount", 1), "Z": ("Unassigned", 1)}
-        links = [{'g_id': "X", 'd_id': "1"}, {'g_id': "Y", 'd_id': None}]
-        assert logic.unlinked_characters(links, live) == [("NoAccount", "Y"), ("Unassigned", "Z")]
-
-    def test_all_three_sections_together_fit_an_embed(self):
-        """A bad week -- conflicts, alts and unlinked characters at once --
-        shares one budget, so it can't exceed Discord's limit."""
-        rows = []
-        for n in range(40):
-            rows += [
-                {'rowid': n * 3, 'd_id': 1000 + n, 'g_id': f"G{n}"},
-                {'rowid': n * 3 + 1, 'd_id': 2000 + n, 'g_id': f"G{n}"},
-                {'rowid': n * 3 + 2, 'd_id': 1000 + n, 'g_id': f"H{n}"},
-            ]
-        live = {}
-        for n in range(40):
-            live[f"G{n}"] = (f"character_number_{n}", 1)
-            live[f"H{n}"] = (f"alt_character_{n}", 1)
-        characters, accounts = logic.find_link_conflicts(rows, live)
-        unlinked = [(f"unassigned_character_{n}", f"U{n:025d}") for n in range(60)]
-        text = logic.format_conflicts(characters, accounts, unlinked)
-        assert characters and accounts
-        assert len(text) < logic.EMBED_DESCRIPTION_LIMIT
