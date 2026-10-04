@@ -208,6 +208,10 @@ GP_AUDIT_WEEKS = 8
 GP_AUDIT_HITS = 3
 GP_AUDIT_MIN_HISTORY = 8
 
+# Shared by both blocks, like CONFLICT_REPORT_BUDGET: an export glitch can flag
+# a whole guild, and an overflow should end in a count, not a silent cut.
+GP_AUDIT_REPORT_BUDGET = 3500
+
 
 def parse_gp_value(value) -> int | None:
     """One stored weekly gain as an int, or None if it is missing or junk.
@@ -312,6 +316,7 @@ def format_gp_audit(
     spiked: list[tuple[int, str]],
     weeks: int = GP_AUDIT_WEEKS,
     hits: int = GP_AUDIT_HITS,
+    budget: int = GP_AUDIT_REPORT_BUDGET,
 ) -> str | None:
     """One guild's audit as an embed body, or None when nobody is flagged.
 
@@ -328,24 +333,23 @@ def format_gp_audit(
         return None
 
     lines = []
+    remaining = budget
     if sustained:
-        lines.append(f"Above {GP_GAIN_BAR} in {hits}+ of the last {weeks} weeks:")
-        block = "\n".join(
-            f"{name}  --  {count} of {weeks}\n    "
-            + ", ".join(str(value) for value in window)
+        entries = [
+            [f"{name}  --  {count} of {weeks}", "    " + ", ".join(str(value) for value in window)]
             for count, name, window in sustained
+        ]
+        remaining = _append_section(
+            lines, entries, remaining, "member(s)",
+            f"Above {GP_GAIN_BAR} in {hits}+ of the last {weeks} weeks:",
         )
-        lines.append(f"```\n{block}\n```")
     else:
         lines.append(f"Nobody above {GP_GAIN_BAR} in {hits}+ of the last {weeks} weeks.")
 
     if spiked:
-        lines.append(f"Above {GP_SPIKE_WEEK} this week:")
         width = max(len(name) for _, name in spiked)
-        block = "\n".join(
-            f"{name:<{width}}  {value:,}" for value, name in spiked
-        )
-        lines.append(f"```\n{block}\n```")
+        entries = [[f"{name:<{width}}  {value:,}"] for value, name in spiked]
+        _append_section(lines, entries, remaining, "member(s)", f"Above {GP_SPIKE_WEEK} this week:")
 
     return "\n".join(lines)
 
@@ -555,6 +559,25 @@ def pack_messages(
     if current:
         messages.append(current)
     return messages
+
+
+def format_weekly_incomplete(error: str) -> str:
+    return (
+        f"Weekly GP job finished with errors: {error}. The snapshot was taken and "
+        f"the report is posted -- don't re-run !GP_weekly for this, it would "
+        f"overwrite this week's snapshot with later totals. !weekly_report "
+        f"re-posts the report once the cause is fixed."
+    )
+
+
+def format_interrupted_weekly_run(run_key: str, started_at: str) -> str:
+    return (
+        f"The weekly run for the week ending {gp_date_label(run_key)} started at "
+        f"{started_at} and never finished -- the bot restarted mid-run, so its "
+        f"report was lost and the role sync and backup may not have run. "
+        f"!weekly_report re-posts the report; if it shows the previous week, the "
+        f"snapshot wasn't taken either, so run !GP_weekly."
+    )
 
 
 def weekly_report_heading(column_name: str, preview: bool = False) -> str:

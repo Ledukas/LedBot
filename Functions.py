@@ -71,13 +71,14 @@ async def get_cell_value(cell: str) -> str:
         return "Failed to fetch boss strategy from spreadsheet"
 
 #get date
-async def get_date():
+async def get_date(today=None):
     # dates and column names:
-    if datetime.today().weekday() == 5:
-        day_temp = datetime.today()
+    today = today or datetime.today()
+    if today.weekday() == 5:
+        day_temp = today
     else: 
-        days_since_saturday = (datetime.today().weekday() - 5) % 7
-        day_temp = datetime.today() - timedelta(days=days_since_saturday)
+        days_since_saturday = (today.weekday() - 5) % 7
+        day_temp = today - timedelta(days=days_since_saturday)
 
     day = day_temp.strftime('%Y_%m_%d')
     one_week_ago = (day_temp - timedelta(days=7)).strftime('%Y_%m_%d')
@@ -108,9 +109,35 @@ WEEKLY_RUNS_TABLE = 'weekly_runs'
 def _ensure_weekly_runs_table():
     c.execute(
         f"CREATE TABLE IF NOT EXISTS {WEEKLY_RUNS_TABLE} "
-        "(run_key TEXT PRIMARY KEY, started_at TEXT)"
+        "(run_key TEXT PRIMARY KEY, started_at TEXT, ended_at TEXT)"
+    )
+    columns = [row[1] for row in c.execute(f"PRAGMA table_info({WEEKLY_RUNS_TABLE})")]
+    if 'ended_at' not in columns:
+        # Every run recorded before this column existed did end; without the
+        # backfill each one would be reported as interrupted.
+        c.execute(f"ALTER TABLE {WEEKLY_RUNS_TABLE} ADD COLUMN ended_at TEXT")
+        c.execute(f"UPDATE {WEEKLY_RUNS_TABLE} SET ended_at = started_at")
+    conn.commit()
+
+
+def mark_weekly_runs_ended():
+    _ensure_weekly_runs_table()
+    c.execute(
+        f"UPDATE {WEEKLY_RUNS_TABLE} SET ended_at = ? WHERE ended_at IS NULL",
+        (datetime.now().isoformat(timespec='seconds'),),
     )
     conn.commit()
+
+
+def interrupted_weekly_run():
+    """(run_key, started_at) of a weekly run that started and never ended --
+    the process died mid-cycle, taking its unposted report with it -- or None.
+    Only meaningful when no weekly job is running in this process."""
+    _ensure_weekly_runs_table()
+    return c.execute(
+        f"SELECT run_key, started_at FROM {WEEKLY_RUNS_TABLE} "
+        "WHERE ended_at IS NULL ORDER BY started_at DESC LIMIT 1"
+    ).fetchone()
 
 
 async def weekly_run_already_started(run_key: str) -> bool:
@@ -174,10 +201,10 @@ def weekly_job():
 
 
 #get the dataframe
-async def GP_dataframe(IOguild):
+async def GP_dataframe(IOguild, today=None):
     table_name_gained = logic.table_name(IOguild, 'GP_gained')
     
-    column_names_dict = await get_date()
+    column_names_dict = await get_date(today)
     column_names = column_names_dict["column_names"]
     column_names_int = column_names_dict["column_names_int"]
     
@@ -363,10 +390,18 @@ def gp_audit_report(IOguild):
     when nobody is flagged. The mirror of red_gp_report."""
     try:
         sustained, spiked = logic.filter_gp_audit(_load_gp_series(IOguild))
+        return logic.section_embeds(IOguild, "GP audit", logic.format_gp_audit(sustained, spiked))
     except Exception as e:
         print("line: " + str(inspect.currentframe().f_lineno) + "\n error: " + str(e))
         return [logic.failure_embed(f"{IOguild} -- GP audit failed", e)]
-    return logic.section_embeds(IOguild, "GP audit", logic.format_gp_audit(sustained, spiked))
+
+
+def snapshot_taken(column_name):
+    """Whether GP_databases has written this week's column for every guild."""
+    return all(
+        column_name in _gp_snapshot_columns(logic.table_name(guild_name, 'GP_gained'))
+        for guild_name in logic.GUILD_NAMES
+    )
 
 
 def _load_link_snapshot(IOguild):
@@ -425,13 +460,13 @@ def conflicts_report(IOguild):
         links, live_characters, _ = _load_link_snapshot(IOguild)
         character_conflicts, account_conflicts = logic.find_link_conflicts(links, live_characters)
         unlinked = logic.unlinked_characters(links, live_characters)
+        return logic.section_embeds(
+            IOguild, "link conflicts",
+            logic.format_conflicts(character_conflicts, account_conflicts, unlinked),
+        )
     except Exception as e:
         print("line: " + str(inspect.currentframe().f_lineno) + "\n error: " + str(e))
         return [logic.failure_embed(f"{IOguild} -- link conflicts failed", e)]
-    return logic.section_embeds(
-        IOguild, "link conflicts",
-        logic.format_conflicts(character_conflicts, account_conflicts, unlinked),
-    )
 
 
 def _recent_gains(IOguild, g_ids):

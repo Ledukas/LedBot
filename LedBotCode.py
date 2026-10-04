@@ -984,7 +984,20 @@ async def run_weekly_gp(ack_channel=None):
     before the cycle's own try block.
     """
     with Functions.weekly_job():
-        await _run_weekly_gp(ack_channel)
+        try:
+            await _run_weekly_gp(ack_channel)
+        finally:
+            # Not reached when the process dies mid-cycle: on_ready then finds
+            # the run unended and says its report was lost.
+            try:
+                Functions.mark_weekly_runs_ended()
+            except Exception as e:
+                print(f"could not mark the weekly run ended: {e}", file=sys.stderr)
+
+
+class WeeklyReportIncomplete(Exception):
+    """The snapshot was taken and the report posted, but a section failed --
+    which is why it must not be answered with a full !GP_weekly re-run."""
 
 
 async def _run_weekly_gp(ack_channel):
@@ -1036,8 +1049,10 @@ async def _run_weekly_gp(ack_channel):
         )
         # Nothing in this finally may raise: an exception here would replace the
         # one that brought us into it and hide why the cycle actually failed.
+        posted = False
         try:
             await send_embeds(LedukasSpam_channel, embeds, content)
+            posted = True
         except Exception as e:
             print(f"could not post the weekly report: {e}", file=sys.stderr)
             try:
@@ -1045,15 +1060,18 @@ async def _run_weekly_gp(ack_channel):
             except Exception as fallback_error:
                 print(f"could not report that either: {fallback_error}", file=sys.stderr)
 
-    # Re-raised only now, after the report is out: it is what makes
-    # gp_weekly_loop (or on_command_error, for !GP_weekly) say the run failed.
+    # Raised only now, after the report is out, so the caller can say the run
+    # had errors without suggesting a re-run that would redo the snapshot.
     if failure is not None:
-        raise failure
+        raise WeeklyReportIncomplete(f"{type(failure).__name__}: {failure}") from failure
     if ack_channel is not None and ack_channel.channel.id != LedukasSpam_channelID:
-        await ack_channel.send(f"Weekly run finished -- the report is in <#{LedukasSpam_channelID}>.")
+        if posted:
+            await ack_channel.send(f"Weekly run finished -- the report is in <#{LedukasSpam_channelID}>.")
+        else:
+            await ack_channel.send("Weekly run finished, but the report could not be posted -- see the bot's log.")
 
 
-async def collect_guild_report(guild_name, report, sync_roles):
+async def collect_guild_report(guild_name, report, sync_roles, today=None):
     """Append one guild's sections of the weekly report to `report`.
 
     Returns the first exception that cost the guild a section, or None. A
@@ -1062,13 +1080,15 @@ async def collect_guild_report(guild_name, report, sync_roles):
     Pretherians its whole report.
     """
     failure = None
+    syncs_roles = sync_roles and guild_name == logic.RANK_ROLE_GUILD
     try:
-        monthly_gp_df = await Functions.GP_dataframe(guild_name)
+        monthly_gp_df = await Functions.GP_dataframe(guild_name, today)
     except Exception as e:
-        failure = _record_failure(report, f"{guild_name} -- GP table failed", e)
+        skipped = ", rank roles not synced" if syncs_roles else ""
+        failure = _record_failure(report, f"{guild_name} -- GP table failed{skipped}", e)
     else:
         # Only one guild runs the GP rank ladder and the Monthly Top role.
-        if sync_roles and guild_name == logic.RANK_ROLE_GUILD:
+        if syncs_roles:
             try:
                 roles_status = await Functions.GP_roles(bot, monthly_gp_df)
             except Exception as e:
@@ -1093,7 +1113,14 @@ def _record_failure(report, title, error):
 @bot.command(name='GP_weekly')
 @commands.has_role("Moderator")
 async def GP_weekly_man(ctx):
-    await run_weekly_gp(ctx)
+    if Functions.weekly_job_depth:
+        await ctx.send("A weekly run is already in progress.")
+        return
+    await ctx.send(f"Weekly run started -- the report will be posted in <#{LedukasSpam_channelID}>.")
+    try:
+        await run_weekly_gp(ctx)
+    except WeeklyReportIncomplete as e:
+        await ctx.send(logic.format_weekly_incomplete(str(e)))
 
 
 @bot.command(name='weekly_report')
@@ -1101,10 +1128,16 @@ async def GP_weekly_man(ctx):
 async def weekly_report(ctx):
     """The latest week's report again, here, without running anything: no
     export, no snapshot, no role changes, no backup."""
-    run_key = (await Functions.get_date())["column_name1"]
+    today = datetime.today()
+    run_key = (await Functions.get_date(today))["column_name1"]
+    if not Functions.snapshot_taken(run_key):
+        # Saturday before the 2 AM run, or after a run that failed before
+        # GP_databases: this week has no column yet, so show the last one.
+        today -= timedelta(days=7)
+        run_key = (await Functions.get_date(today))["column_name1"]
     report = []
     for guild_name in logic.GUILD_NAMES:
-        await collect_guild_report(guild_name, report, sync_roles=False)
+        await collect_guild_report(guild_name, report, sync_roles=False, today=today)
     content, embeds = logic.finish_weekly_report(
         logic.weekly_report_heading(run_key, preview=True), report, None
     )
@@ -1149,6 +1182,13 @@ async def gp_weekly_loop():
     # mode baba_ping was hardened against.
     try:
         await run_weekly_gp()
+    except WeeklyReportIncomplete as e:
+        # Its traceback was already logged where it happened.
+        print(f"weekly GP job finished with errors: {e}", file=sys.stderr)
+        try:
+            await LedukasSpam_channel.send(logic.format_weekly_incomplete(str(e)))
+        except Exception as send_error:
+            print(f"could not report weekly GP errors: {send_error}", file=sys.stderr)
     except Exception as e:
         print(f"weekly GP job failed: {e}", file=sys.stderr)
         traceback.print_exception(type(e), e, e.__traceback__)
@@ -1185,8 +1225,10 @@ async def send_embeds(destination, embeds, content=None):
         # Without it Discord drops the embeds and posts only the content line,
         # which would look like a report with nothing in it.
         notice = "I can't show this report here: I need the Embed Links permission in this channel."
+        # The footer carries the weekly backup's name, the proof the job ran.
+        footer = embeds[-1].footer.text
         await destination.send(
-            f"{content}\n{notice}" if content else notice,
+            "\n".join(line for line in (content, notice, footer) if line),
             allowed_mentions=discord.AllowedMentions.none(),
         )
         return
@@ -1472,6 +1514,21 @@ async def on_ready():
               "will link and give roles but skip the welcome", file=sys.stderr)
 
     await load_cogs()
+    await report_interrupted_weekly_run()
+
+
+async def report_interrupted_weekly_run():
+    # on_ready also fires on reconnects, including mid-run, when the run is
+    # merely in progress rather than interrupted.
+    if Functions.weekly_job_depth or LedukasSpam_channel is None:
+        return
+    try:
+        interrupted = Functions.interrupted_weekly_run()
+        if interrupted is not None:
+            await report_to_mods(logic.format_interrupted_weekly_run(*interrupted))
+            Functions.mark_weekly_runs_ended()
+    except Exception as e:
+        print(f"could not check for an interrupted weekly run: {e}", file=sys.stderr)
 
 if __name__ == "__main__":
     bot.run(TOKEN)
