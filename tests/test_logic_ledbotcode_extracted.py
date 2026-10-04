@@ -1,5 +1,6 @@
 """Tests for the logic.py functions extracted from LedBotCode.py."""
 
+from datetime import datetime
 from types import SimpleNamespace
 
 import pandas as pd
@@ -50,17 +51,27 @@ class TestFilterPersonalGains:
         assert result.empty
 
 
-class TestInterpretActionResult:
-    def test_none_is_failure(self):
-        assert logic.interpret_action_result(None, "ok", "fail") == "fail"
+class TestPickLinkedCharacter:
+    def test_no_rows(self):
+        assert logic.pick_linked_character([]) is None
 
-    @pytest.mark.parametrize("value", ["true", "True", "TRUE"])
-    def test_true_case_insensitive_is_success(self, value):
-        assert logic.interpret_action_result(value, "ok", "fail") == "ok"
+    def test_a_departed_first_row_does_not_win_over_a_live_one(self):
+        """!kick and !mygains took the account's first row, which for a member
+        on their second character is one that left the guild."""
+        rows = [('old', 'OldName', 0), ('new', 'NewName', 1)]
+        assert logic.pick_linked_character(rows) == ('new', 'NewName')
 
-    @pytest.mark.parametrize("value", ["false", "maybe", ""])
-    def test_other_values_are_failure(self, value):
-        assert logic.interpret_action_result(value, "ok", "fail") == "fail"
+    def test_first_live_row_wins_among_several(self):
+        rows = [('gone', 'Gone', 0), ('a', 'A', 1), ('b', 'B', 1)]
+        assert logic.pick_linked_character(rows) == ('a', 'A')
+
+    def test_falls_back_to_the_oldest_row_when_none_is_live(self):
+        rows = [('old', 'Old', 0), ('older', 'Older', 0)]
+        assert logic.pick_linked_character(rows) == ('old', 'Old')
+
+    def test_blank_rows_are_skipped(self):
+        assert logic.pick_linked_character([('', '', 0), (None, None, 0)]) is None
+        assert logic.pick_linked_character([('', '', 0), ('g1', 'A', 0)]) == ('g1', 'A')
 
 
 class TestAssignErrorMessage:
@@ -162,6 +173,21 @@ class TestIsUnexpectedCommandError:
         assert logic.is_unexpected_command_error(error) is True
 
 
+class TestBabaPingDue:
+    def test_only_in_the_ping_minute(self):
+        assert logic.baba_ping_due(datetime(2026, 10, 3, 14, 57, 5), None)
+        assert not logic.baba_ping_due(datetime(2026, 10, 3, 14, 56, 59), None)
+        assert not logic.baba_ping_due(datetime(2026, 10, 3, 14, 58, 0), None)
+
+    def test_a_second_tick_in_the_same_minute_does_not_ping_again(self):
+        first = datetime(2026, 10, 3, 14, 57, 5)
+        assert not logic.baba_ping_due(datetime(2026, 10, 3, 14, 57, 45), first)
+
+    def test_pings_again_the_next_hour(self):
+        first = datetime(2026, 10, 3, 14, 57, 5)
+        assert logic.baba_ping_due(datetime(2026, 10, 3, 15, 57, 25), first)
+
+
 class TestIsSaturday:
     @pytest.mark.parametrize("weekday,expected", [
         (0, False), (1, False), (2, False), (3, False),
@@ -177,68 +203,87 @@ class TestIsSaturday:
 
 
 class TestShouldRunWeeklyGp:
-    """The loop polls local time every 15 minutes, so these pin both halves:
-    it fires in the 2 AM hour on a Saturday, and only once per Saturday."""
+    """From 2 AM Saturday until the snapshot is taken, retrying every 10
+    minutes until 4 AM and every 30 until midnight -- timed from the last
+    attempt's start, which comes from the database."""
 
-    from datetime import datetime as _dt
+    from datetime import datetime as _dt, timedelta as _td
 
     SATURDAY_2AM = _dt(2026, 9, 12, 2, 0)
 
     def test_fires_on_saturday_at_two(self):
-        assert logic.should_run_weekly_gp(self.SATURDAY_2AM, False) is True
+        assert logic.should_run_weekly_gp(self.SATURDAY_2AM, False, None) is True
+
+    def test_not_before_two(self):
+        assert logic.should_run_weekly_gp(self.SATURDAY_2AM.replace(hour=1, minute=59), False, None) is False
+
+    def test_a_bot_that_was_down_at_two_runs_when_it_comes_back(self):
+        assert logic.should_run_weekly_gp(self.SATURDAY_2AM.replace(hour=11), False, None) is True
 
     def test_does_not_fire_on_other_days(self):
-        from datetime import timedelta
         for offset in range(1, 7):
-            day = self.SATURDAY_2AM + timedelta(days=offset)
-            assert logic.should_run_weekly_gp(day, False) is False, day
+            day = self.SATURDAY_2AM + self._td(days=offset)
+            assert logic.should_run_weekly_gp(day, False, None) is False, day
 
-    def test_does_not_fire_at_other_hours(self):
-        for hour in (0, 1, 3, 12, 21, 23):
+    def test_a_taken_snapshot_never_reruns(self):
+        """The duplicate weekly report this loop was rewritten to prevent."""
+        for hour in range(2, 24):
             when = self.SATURDAY_2AM.replace(hour=hour)
-            assert logic.should_run_weekly_gp(when, False) is False, hour
+            assert logic.should_run_weekly_gp(when, True, self.SATURDAY_2AM) is False, hour
 
-    def test_only_runs_once_per_saturday(self):
-        """Every tick inside the 2 AM hour would otherwise re-run the job --
-        the duplicate weekly report this loop was rewritten to prevent."""
-        assert logic.should_run_weekly_gp(self.SATURDAY_2AM, False) is True
-        for minute in (0, 15, 30, 45):
-            when = self.SATURDAY_2AM.replace(minute=minute)
-            assert logic.should_run_weekly_gp(when, True) is False, minute
+    def test_retries_every_ten_minutes_until_four(self):
+        last = self.SATURDAY_2AM
+        assert logic.should_run_weekly_gp(last + self._td(minutes=5), False, last) is False
+        assert logic.should_run_weekly_gp(last + self._td(minutes=10), False, last) is True
 
-    def test_runs_again_once_the_new_week_is_unmarked(self):
-        """already_ran is keyed on this week's snapshot column, so a new
-        Saturday reads as not-yet-run even though last week was."""
-        assert logic.should_run_weekly_gp(self.SATURDAY_2AM, False) is True
+    def test_then_every_thirty_minutes(self):
+        last = self.SATURDAY_2AM.replace(hour=5)
+        assert logic.should_run_weekly_gp(last + self._td(minutes=20), False, last) is False
+        assert logic.should_run_weekly_gp(last + self._td(minutes=30), False, last) is True
+
+    def test_stops_at_midnight(self):
+        last = self.SATURDAY_2AM.replace(hour=23, minute=40)
+        assert logic.should_run_weekly_gp(last + self._td(minutes=30), False, last) is False
+
+    def test_a_start_time_from_a_wrong_clock_does_not_block_retries(self):
+        """The Pi has no clock battery; a marker written hours in the future
+        must not hold the retries off for the rest of the day."""
+        future = self.SATURDAY_2AM.replace(hour=9)
+        assert logic.should_run_weekly_gp(self.SATURDAY_2AM.replace(hour=3), False, future) is True
 
 
-class TestWeeklyGpWindow:
-    """The loop applies is_weekly_gp_window as a cheap per-tick gate and
-    should_run_weekly_gp applies it again before the persistence lookup. These
-    pin that there is only one schedule, so the two cannot drift apart."""
-
+class TestWeeklyRetrySchedule:
     from datetime import datetime as _dt
 
-    def test_window_matches_the_named_hour(self):
-        saturday = self._dt(2026, 9, 12)
-        for hour in range(24):
-            expected = hour == logic.WEEKLY_GP_HOUR
-            assert logic.is_weekly_gp_window(saturday.replace(hour=hour)) is expected, hour
+    def test_ten_minutes_then_thirty_then_stop(self):
+        assert logic.weekly_retry_interval(0) == 600
+        assert logic.weekly_retry_interval(2 * 3600 - 1) == 600
+        assert logic.weekly_retry_interval(2 * 3600) == 1800
+        assert logic.weekly_retry_interval(22 * 3600 - 1) == 1800
+        assert logic.weekly_retry_interval(22 * 3600) is None
 
-    def test_window_is_saturday_only(self):
-        from datetime import timedelta
-        saturday_at_hour = self._dt(2026, 9, 12, logic.WEEKLY_GP_HOUR)
-        for offset in range(1, 7):
-            assert logic.is_weekly_gp_window(saturday_at_hour + timedelta(days=offset)) is False
+    def test_the_schedule_ends_at_midnight(self):
+        assert logic.WEEKLY_GP_HOUR * 3600 + logic.WEEKLY_RETRY_SCHEDULE[-1][0] == 24 * 3600
 
-    def test_should_run_never_fires_outside_the_window(self):
-        """If these two ever disagreed, the loop's gate would block the tick
-        should_run_weekly_gp would have accepted, and the job would silently
-        stop running."""
-        from datetime import timedelta
-        start = self._dt(2026, 9, 7)
-        t = start
-        while t < start + timedelta(days=7):
-            if logic.should_run_weekly_gp(t, False):
-                assert logic.is_weekly_gp_window(t) is True, t
-            t += timedelta(minutes=15)
+    def test_the_window_opens_at_two_on_the_named_saturday(self):
+        assert logic.weekly_window_opens("GP2026_09_12") == self._dt(2026, 9, 12, 2)
+
+
+class TestSnapshotReminderDue:
+    from datetime import datetime as _dt, timedelta as _td
+
+    RUN_KEY = "GP2026_09_12"
+
+    def test_not_while_saturday_retries_are_still_going(self):
+        assert logic.snapshot_reminder_due(self._dt(2026, 9, 12, 23, 55), self.RUN_KEY, False, None) is False
+
+    def test_from_sunday_midnight(self):
+        assert logic.snapshot_reminder_due(self._dt(2026, 9, 13, 0, 0), self.RUN_KEY, False, None) is True
+
+    def test_then_once_a_day(self):
+        last = self._dt(2026, 9, 13, 0, 5)
+        assert logic.snapshot_reminder_due(last + self._td(hours=23), self.RUN_KEY, False, last) is False
+        assert logic.snapshot_reminder_due(last + self._td(hours=24), self.RUN_KEY, False, last) is True
+
+    def test_never_once_taken(self):
+        assert logic.snapshot_reminder_due(self._dt(2026, 9, 15), self.RUN_KEY, True, None) is False

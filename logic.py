@@ -12,7 +12,7 @@ compute_gp_rank_role, filter_red_gp, compute_remaining_to_rankup and
 command_error_message. Those are noted in TODO.md as fixed.
 """
 
-from datetime import datetime
+from datetime import date, datetime, timedelta
 import math
 import re
 
@@ -25,13 +25,6 @@ from discord.ext import commands
 # Shared constants
 # ---------------------------------------------------------------------------
 
-# The Aetherian rank ladder, ascending. This lived in both LedBotCode.py and
-# Functions.py, and the two copies fed different things: the flat threshold
-# list drives the "GP needed to rank up" figure in !mygains, while the
-# (threshold, role) pairs drive the roles actually assigned. A threshold
-# changed in only one file would have had the bot quoting one scale and
-# assigning on another, with nothing raising an error. Both are derived from
-# this single table now, so they cannot disagree.
 # The two IdleOn guilds. The Discord role name matches the guild name exactly,
 # which is what members_discord relies on when it looks the role up.
 GUILD_GIDS = {
@@ -74,6 +67,13 @@ def table_name(guild_name: str, kind: str) -> str:
     return f"{guild_name}_{kind}"
 
 
+# The Aetherian rank ladder, ascending. This lived in both LedBotCode.py and
+# Functions.py, and the two copies fed different things: the flat threshold
+# list drives the "GP needed to rank up" figure in !mygains, while the
+# (threshold, role) pairs drive the roles actually assigned. A threshold
+# changed in only one file would have had the bot quoting one scale and
+# assigning on another, with nothing raising an error. Both are derived from
+# this single table now, so they cannot disagree.
 RANK_THRESHOLDS: list[tuple[int, str]] = [
     (1000, 'Aetherian Knight'),
     (2500, 'Aetherian Hero'),
@@ -110,6 +110,65 @@ def compute_gp_rank_role(gp: int, thresholds: list[tuple[int, str]]) -> str | No
     return target
 
 
+ROLE_SYNC_FAILURES_SHOWN = 5
+
+
+def format_role_sync_status(skipped: str | None, failures: list[str]) -> str | None:
+    """GP_roles' result: None when everything synced, else why it didn't --
+    a skipped step, the members Discord refused a role change for, or both."""
+    parts = [skipped] if skipped else []
+    if failures:
+        shown = "; ".join(failures[:ROLE_SYNC_FAILURES_SHOWN])
+        more = len(failures) - ROLE_SYNC_FAILURES_SHOWN
+        parts.append(
+            f"{len(failures)} role change(s) failed -- {shown}"
+            + (f"; and {more} more" if more > 0 else "")
+        )
+    return "; ".join(parts) or None
+
+
+DISCORD_MESSAGE_LIMIT = 2000
+
+
+def split_message(text: str, limit: int = DISCORD_MESSAGE_LIMIT) -> list[str]:
+    """text as messages that each fit Discord's limit, split between lines.
+
+    A code block cut by a split is closed and reopened, so every part still
+    renders as a block.
+    """
+    if len(text) <= limit:
+        return [text]
+    fence = "```"
+    room = limit - 2 * (len(fence) + 1)
+    lines = []
+    for line in text.split("\n"):
+        while len(line) > room:
+            lines.append(line[:room])
+            line = line[room:]
+        lines.append(line)
+
+    parts: list[str] = []
+    current: list[str] = []
+    used = 0
+    in_fence = False
+    for line in lines:
+        if current and used + len(line) + 1 > room:
+            parts.append("\n".join(current + ([fence] if in_fence else [])))
+            if in_fence and line == fence:
+                # That fence was the block's own closing one; reopening here
+                # would send an empty block.
+                current, used, in_fence = [], 0, False
+                continue
+            current = [fence] if in_fence else []
+            used = len(fence) + 1 if in_fence else 0
+        current.append(line)
+        used += len(line) + 1
+        if line.startswith(fence):
+            in_fence = not in_fence
+    parts.append("\n".join(current))
+    return parts
+
+
 def filter_top_average(df: pd.DataFrame, threshold: int = 649) -> pd.DataFrame:
     """Rows whose 'Average' column exceeds threshold (the 'Monthly Top' / clammy cutoff)."""
     return df[df['Average'] > threshold]
@@ -129,7 +188,7 @@ def build_gp_dataframe(
 
     for column in column_names_int:
         df[column] = pd.to_numeric(df[column], errors='coerce')
-    df[column_names_int] = df[column_names_int].fillna(pd.NA).astype('Int64')
+    df[column_names_int] = df[column_names_int].astype('Int64')
 
     # Strip each column's own "GP{year}_" prefix (not a hardcoded year) since the
     # 4 columns here can legitimately span two different years near a year boundary
@@ -141,11 +200,6 @@ def build_gp_dataframe(
     df = df.rename(columns=new_column_names)
 
     df['Average'] = df.iloc[:, 2:].mean(axis=1)
-    # Preserved from the original as-is (not removed): this line appears to be
-    # dead code -- a nullable-Int64 mean of an all-NA row already yields pd.NA,
-    # not the literal string 'NAType', so this .replace likely never matches
-    # anything. Kept for behavioral fidelity rather than assumed safe to drop.
-    df['Average'] = df['Average'].replace('NAType', pd.NA)
     df['Average'] = pd.to_numeric(df['Average'], errors='coerce')
     df['Average'] = df['Average'].round(1)
     return df
@@ -173,6 +227,79 @@ def filter_red_gp(df: pd.DataFrame, io_guild: str, blacklist: list[str]) -> pd.D
     filtered = filtered.drop('G_ID', axis=1)
     filtered = filtered.sort_values(filtered.columns[4])
     return filtered
+
+
+# ---------------------------------------------------------------------------
+# Weekly snapshots -- the GP{year}_{month}_{day} columns GP_databases adds to
+# {guild}_GP (measured totals) and {guild}_GP_gained (weekly gains) each
+# Saturday, and how a missed Saturday is filled in.
+# ---------------------------------------------------------------------------
+
+SNAPSHOT_COLUMN_RE = re.compile(r'^GP(\d{4})_(\d{2})_(\d{2})$')
+
+
+def snapshot_column(day: date) -> str:
+    return f"GP{day.strftime('%Y_%m_%d')}"
+
+
+def snapshot_date(column: str) -> date | None:
+    match = SNAPSHOT_COLUMN_RE.match(column)
+    if not match:
+        return None
+    try:
+        return date(*map(int, match.groups()))
+    except ValueError:
+        return None
+
+
+def sorted_snapshot_columns(names) -> list[str]:
+    """The snapshot columns among `names`, oldest first."""
+    return sorted((name for name in names if snapshot_date(name)), key=snapshot_date)
+
+
+def missed_snapshot_columns(previous: str | None, current: str) -> list[str]:
+    """The Saturdays strictly between two snapshots, oldest first.
+
+    Walked back from `current`, which is always a Saturday, so every name is
+    one get_date() would produce even if `previous` is an odd early column.
+    """
+    if previous is None:
+        return []
+    start, day = snapshot_date(previous), snapshot_date(current) - timedelta(days=7)
+    missed = []
+    while day > start:
+        missed.append(snapshot_column(day))
+        day -= timedelta(days=7)
+    return missed[::-1]
+
+
+def spread_gain(total: int, weeks: int) -> list[int]:
+    """`total` split evenly over `weeks`, summing to it exactly.
+
+    The remainder goes to the latest weeks, so the catch-up week -- the one
+    that was actually measured -- carries any odd point.
+    """
+    base, extra = divmod(total, weeks)
+    return [base + (1 if index >= weeks - extra else 0) for index in range(weeks)]
+
+
+def estimated_gain_columns(gained_columns, measured_columns) -> set[str]:
+    """The weeks whose gain is a spread share rather than a measurement.
+
+    A gain is exact only when its Saturday and the one before it were both
+    measured. That covers the missed weeks, which have no measured total at
+    all, and also the catch-up week: its total is real, but its gain is one
+    share of a multi-week difference.
+    """
+    measured = set(measured_columns)
+    estimated = set()
+    for column in gained_columns:
+        day = snapshot_date(column)
+        if day is None:
+            continue
+        if column not in measured or snapshot_column(day - timedelta(days=7)) not in measured:
+            estimated.add(column)
+    return estimated
 
 
 # ---------------------------------------------------------------------------
@@ -225,7 +352,21 @@ def parse_gp_value(value) -> int | None:
         return None
 
 
-def observed_weeks(series: list[int | None]) -> list[int]:
+class EstimatedGain(int):
+    """A weekly gain that is a share of a missed snapshot's spread.
+
+    Counts like any other number, so the sustained rule needs no special
+    case; prints with a ~ so a moderator judging a flag can see which weeks
+    were not measured.
+    """
+
+    def __str__(self) -> str:
+        return f"~{int(self)}"
+
+    __repr__ = __str__
+
+
+def observed_weeks(series: list[int | None], estimated=frozenset()) -> list[int]:
     """Usable weekly gains from a member's full history, oldest first.
 
     Drops the first recorded week: Functions.GP_databases computes a gain
@@ -235,19 +376,30 @@ def observed_weeks(series: list[int | None]) -> list[int]:
     mid-history -- Pretherians has a duplicated row carrying one player's early
     history spliced onto another's join week, putting a 20300 in the middle of
     an otherwise ordinary series.
+
+    `estimated` holds the positions in `series` whose gain was spread over a
+    missed snapshot; those come back as EstimatedGain.
     """
-    recorded = [value for value in series if value is not None]
-    return [value for value in recorded[1:] if value <= GP_IMPLAUSIBLE_WEEK]
+    recorded = [(index, value) for index, value in enumerate(series) if value is not None]
+    return [
+        EstimatedGain(value) if index in estimated else value
+        for index, value in recorded[1:]
+        if value <= GP_IMPLAUSIBLE_WEEK
+    ]
 
 
-def latest_week(series: list[int | None]) -> int | None:
+def latest_week(series: list[int | None], estimated=frozenset()) -> int | None:
     """Gain in the newest snapshot, or None if there is no usable figure.
 
     Read off the newest column rather than off the member's last recorded
     week, so a member missing from the latest export is not reported on a
     figure that is several weeks old.
+
+    An estimated newest week is never a figure: spreading turns a real 2,000
+    spike into 1,000 + 1,000 and a quiet pair into anything, so the spike rule
+    would be judging an average.
     """
-    if not series:
+    if not series or len(series) - 1 in estimated:
         return None
     value = series[-1]
     if value is None or value > GP_IMPLAUSIBLE_WEEK:
@@ -257,15 +409,15 @@ def latest_week(series: list[int | None]) -> int | None:
     return value
 
 
-def audit_member(series: list[int | None], weeks: int = GP_AUDIT_WEEKS) -> dict:
+def audit_member(series: list[int | None], weeks: int = GP_AUDIT_WEEKS, estimated=frozenset()) -> dict:
     """Both audit signals for one member's history."""
-    history = observed_weeks(series)
+    history = observed_weeks(series, estimated)
     window = history[-weeks:]
     return {
         "history": len(history),
         "hits": sum(1 for value in window if value > GP_GAIN_BAR),
         "window": window,
-        "latest": latest_week(series),
+        "latest": latest_week(series, estimated),
     }
 
 
@@ -274,6 +426,7 @@ def filter_gp_audit(
     weeks: int = GP_AUDIT_WEEKS,
     hits: int = GP_AUDIT_HITS,
     min_history: int = GP_AUDIT_MIN_HISTORY,
+    estimated=frozenset(),
 ) -> tuple[list[tuple[int, str, list[int]]], list[tuple[int, str]]]:
     """Split members into (sustained, spiked), each sorted worst-first.
 
@@ -289,8 +442,11 @@ def filter_gp_audit(
     min_history gates only the sustained side. It exists to keep a member with
     two weeks of history off a window-based count; a member three weeks into
     the guild posting an enormous week is exactly what the spike check is for.
+
+    `estimated` is the set of series positions whose gain was spread over a
+    missed snapshot (the columns are shared, so one set serves every member).
     """
-    audited = {name: audit_member(series, weeks) for name, series in members.items()}
+    audited = {name: audit_member(series, weeks, estimated) for name, series in members.items()}
 
     sustained = sorted(
         (
@@ -339,10 +495,18 @@ def format_gp_audit(
             [f"{name}  --  {count} of {weeks}", "    " + ", ".join(str(value) for value in window)]
             for count, name, window in sustained
         ]
+        start = len(lines)
         remaining = _append_section(
             lines, entries, remaining, "member(s)",
             f"Above {GP_GAIN_BAR} in {hits}+ of the last {weeks} weeks:",
         )
+        # Only when a ~ made it into the listed weeks (indented rows; names
+        # never are), and charged to the budget the spike block draws on.
+        shown_weeks = [row for line in lines[start:] for row in line.split("\n") if row.startswith("    ")]
+        if any("~" in row for row in shown_weeks):
+            legend = "~ marks a week estimated from a missed snapshot."
+            lines.append(legend)
+            remaining -= len(legend) + 1
     else:
         lines.append(f"Nobody above {GP_GAIN_BAR} in {hits}+ of the last {weeks} weeks.")
 
@@ -571,14 +735,177 @@ def format_weekly_incomplete(error: str) -> str:
     )
 
 
-def format_interrupted_weekly_run(run_key: str, started_at: str) -> str:
-    return (
+def format_interrupted_weekly_run(
+    run_key: str, started_at: str, snapshot_taken: bool, retrying: bool,
+) -> str:
+    message = (
         f"The weekly run for the week ending {gp_date_label(run_key)} started at "
         f"{started_at} and never finished -- the bot restarted mid-run, so its "
-        f"report was lost and the role sync and backup may not have run. "
-        f"!weekly_report re-posts the report; if it shows the previous week, the "
-        f"snapshot wasn't taken either, so run !GP_weekly."
+        f"report was lost."
     )
+    if snapshot_taken:
+        return message + (
+            " The snapshot was saved, but the role sync and backup may not have "
+            "run. !weekly_report re-posts the report."
+        )
+    if retrying:
+        return message + " Nothing was saved; I'll keep retrying until midnight."
+    return message + (
+        " Nothing was saved. Next Saturday's run will spread the missing gain "
+        "evenly over both weeks."
+    )
+
+
+def format_weekly_failure(error: BaseException | str, retrying: bool, now: datetime) -> str:
+    if not retrying:
+        return f"Weekly GP job failed: {error}. It will not retry automatically -- see the bot's log."
+    opened = now.replace(hour=WEEKLY_GP_HOUR, minute=0, second=0, microsecond=0)
+    (fast_until, fast), (_, slow) = WEEKLY_RETRY_SCHEDULE
+    if weekly_retry_interval((now - opened).total_seconds()) == fast:
+        cadence = (
+            f"every {fast // 60} minutes, then every {slow // 60} from "
+            f"{WEEKLY_GP_HOUR + fast_until // 3600} AM,"
+        )
+    else:
+        cadence = f"every {slow // 60} minutes"
+    return (
+        f"Weekly GP job failed: {error}. Nothing was saved for this week, so "
+        f"I'll retry {cadence} until midnight."
+    )
+
+
+def format_manual_weekly_failure(error: BaseException | str, snapshot_taken: bool) -> str:
+    saved = (
+        "This week's snapshot is saved." if snapshot_taken
+        else "Nothing was saved for this week."
+    )
+    return f"Weekly run failed: {error}. {saved}"
+
+
+def format_gp_weekly_refused(snapshot_taken: bool) -> str:
+    """Why !GP_weekly won't run mid-week without `force`."""
+    if snapshot_taken:
+        consequence = (
+            "it would overwrite Saturday's snapshot with today's totals, and next "
+            "week's gain would then be measured from today"
+        )
+    else:
+        consequence = (
+            "it would save today's totals as Saturday's snapshot, with nothing to "
+            "say they are days late. Next Saturday's run fills a missing week in "
+            "by spreading the gain evenly, and labels it"
+        )
+    return (
+        f"!GP_weekly only runs on Saturdays: today {consequence}. "
+        f"Type `!GP_weekly force` to run it anyway."
+    )
+
+
+def format_snapshot_reminder(
+    run_key: str, attempted: bool, last_error: str | None, login_rejected: bool,
+) -> str:
+    message = f"No GP snapshot was taken for the week ending {gp_date_label(run_key)}."
+    if login_rejected:
+        message += (
+            " The guild login was rejected, so I stopped trying -- fix the password "
+            "in .env and restart the bot."
+        )
+    elif not attempted:
+        message += " The bot wasn't running on Saturday."
+    elif last_error:
+        message += f" Every attempt on Saturday failed; the last error: {last_error}."
+    else:
+        message += " Every attempt on Saturday failed."
+    return message + (
+        " Fix the cause before next Saturday 2 AM: that run spreads the missing "
+        "gain evenly over both weeks. !members_game checks the login without "
+        "touching the snapshot."
+    )
+
+
+# The share of members gaining exactly 0 above which the week looks like a
+# roster that never refreshed rather than a quiet week. History runs 3-20%; a
+# stale roster gives everyone 0.
+SNAPSHOT_ZERO_SHARE_WARN = 0.5
+
+
+def snapshot_problems(status: dict, retake_possible: bool) -> list[str]:
+    """What looks wrong with one guild's freshly taken snapshot."""
+    if not status['present']:
+        return ["This week's snapshot column is missing."]
+    problems = []
+    roster, recorded, zeros = status['roster'], status['recorded'], status['zeros']
+    if recorded < roster:
+        problems.append(f"{roster - recorded} of {roster} in-game members have no GP recorded.")
+    if recorded and zeros / recorded > SNAPSHOT_ZERO_SHARE_WARN:
+        line = f"{zeros} of {recorded} members gained 0 -- the in-game roster may not have refreshed."
+        if retake_possible:
+            line += " If so, run !GP_weekly to retake this week's snapshot."
+        problems.append(line)
+    return problems
+
+
+def snapshot_lateness(run_key: str, started_at: datetime | None) -> timedelta | None:
+    """How long after Saturday 2 AM the snapshot was taken, if over an hour.
+
+    The hour absorbs the loop's tick; past it, a snapshot can hold GP earned
+    after the in-game week turned over, which matters when reading that week's
+    red list and audit.
+    """
+    if started_at is None:
+        return None
+    late = started_at - weekly_window_opens(run_key)
+    return late if late > timedelta(hours=1) else None
+
+
+def _format_lateness(late: timedelta) -> str:
+    hours = int(late.total_seconds() // 3600)
+    return f"{hours}h" if hours < 48 else f"{hours // 24} days"
+
+
+def format_snapshot_note(statuses: list[dict], late: timedelta | None = None) -> str:
+    """The one-line proof the week's data was taken, e.g. 'Snapshot:
+    Aetherians 209/209, Pretherians 204/204'."""
+    parts = []
+    for status in statuses:
+        part = f"{status['guild']} {status['recorded']}/{status['roster']}"
+        if status['negatives']:
+            part += f" ({status['negatives']} negative)"
+        parts.append(part)
+    note = "Snapshot: " + ", ".join(parts)
+    if late is not None:
+        note += f" -- taken {_format_lateness(late)} late"
+    return note
+
+
+def _join_labels(columns: list[str]) -> str:
+    labels = [gp_date_label(column) for column in columns]
+    return labels[0] if len(labels) == 1 else f"{', '.join(labels[:-1])} and {labels[-1]}"
+
+
+def format_estimated_weeks(statuses: list[dict]) -> str | None:
+    """Which weeks were spread over a missed snapshot, or None.
+
+    Grouped, since both guilds normally miss the same Saturdays; a guild is
+    named only when they differ.
+    """
+    spans: dict[tuple, list[str]] = {}
+    for status in statuses:
+        if status['missed']:
+            key = (status['previous'], tuple(status['missed']), status['column'])
+            spans.setdefault(key, []).append(status['guild'])
+    if not spans:
+        return None
+    lines = []
+    for (previous, missed, column), guilds in spans.items():
+        prefix = "" if len(spans) == 1 else f"{', '.join(guilds)}: "
+        lines.append(
+            f"{prefix}No snapshot was taken for {_join_labels(list(missed))}. The gain "
+            f"since {gp_date_label(previous)} was spread evenly over "
+            f"{_join_labels([*missed, column])}, so those weeks are estimates -- "
+            f"totals are exact. The GP audit's spike check skips them."
+        )
+    return "\n".join(lines)
 
 
 def weekly_report_heading(column_name: str, preview: bool = False) -> str:
@@ -590,22 +917,29 @@ def finish_weekly_report(
     heading: str,
     embeds: list[discord.Embed],
     backup_name: str | None,
+    snapshot_note: str | None = None,
 ) -> tuple[str, list[discord.Embed]]:
     """The content line and embeds for one weekly post.
 
     Never empty: a week with nothing to report still posts its heading, so a
-    quiet week can be told apart from a job that never ran. The backup's name
-    rides in the last embed's footer, or on the heading when there are no
-    embeds. A footer renders no markdown; the heading needs the backticks,
-    since backup names contain underscores.
+    quiet week can be told apart from a job that never ran. The snapshot note
+    and the backup's name -- the proof the data was taken and saved -- ride in
+    the last embed's footer, or on the heading when there are no embeds. A
+    footer renders no markdown; the heading needs the backticks, since backup
+    names contain underscores.
     """
     if not embeds:
         content = f"{heading} -- nothing to report."
+        if snapshot_note:
+            content += f" {snapshot_note}."
         if backup_name:
             content += f" Backup: `{backup_name}`"
         return content, []
-    if backup_name:
-        embeds[-1].set_footer(text=f"Backup: {backup_name}")
+    footer = " · ".join(
+        part for part in (snapshot_note, f"Backup: {backup_name}" if backup_name else None) if part
+    )
+    if footer:
+        embeds[-1].set_footer(text=footer)
     return heading, embeds
 
 
@@ -620,10 +954,13 @@ def build_game_members_rows(data: dict) -> list[dict]:
     """Turn a Firebase guild-members payload into row dicts ready for a dataframe."""
     rows = []
     for member_id, member_data in data.items():
+        # A malformed entry becomes a row with gaps rather than a KeyError, so
+        # validate_roster_rows refuses the roster and says why.
+        fields = member_data if isinstance(member_data, dict) else {}
         rows.append({
-            'G_NAME': member_data['a'],
+            'G_NAME': fields.get('a'),
             'G_ID': member_id,
-            'GP': member_data['e'],
+            'GP': fields.get('e'),
         })
     return rows
 
@@ -1538,6 +1875,27 @@ def action_succeeded(result_value: str | None) -> bool:
     return result_value is not None and result_value.lower() == 'true'
 
 
+KICK_DONE = 'done'
+KICK_REFUSED = 'refused'
+KICK_UNKNOWN = 'unknown'
+
+
+def kick_outcome(status_code: int, payload) -> str:
+    """What the game's reply to a kick says happened.
+
+    Refused only when the game said so: a "result" that isn't true, or a
+    client error (a rejected token, a bad request), which is answered before
+    anything is done. A server error or a reply with no readable result may
+    follow a kick that went through.
+    """
+    result = parse_action_result(payload)
+    if action_succeeded(result):
+        return KICK_DONE
+    if result is not None or 400 <= status_code < 500:
+        return KICK_REFUSED
+    return KICK_UNKNOWN
+
+
 def parse_optional_id(value) -> int | None:
     """A Discord id from the environment, or None when unset or malformed.
 
@@ -1809,8 +2167,8 @@ def roster_changed(rows: list[dict], current_pairs) -> bool:
 def validate_roster_rows(rows: list[dict], current_count: int) -> str | None:
     """Why a freshly read roster must not be written to {guild}_game, or None.
 
-    A NULL game id reaching {guild}_GP would make GP_databases' `NOT IN` match
-    nothing, silently stopping every new member from being tracked. And a
+    A NULL game id must never reach {guild}_GP: it is what the tables are
+    keyed on, and the old `NOT IN` insert matched nothing once one was there. And a
     roster that has suddenly lost half its members is far likelier to be a
     partial read than a mass exodus.
     """
@@ -1890,8 +2248,8 @@ def format_welcome(io_guild: str, d_id, welcome_channel_id: int, roles_channel_i
 
 
 def suggest_assign_command(io_guild: str, d_id, name: str) -> str:
-    """A ready-to-paste !assign. !assign parses the user as int(...) first, so
-    this uses the numeric id -- a mention would fall through to a name lookup."""
+    """A ready-to-paste !assign, with the numeric id rather than a mention so
+    pasting it pings nobody."""
     return f"!assign {io_guild} {normalize_discord_id(d_id) or '<discord id>'} {name}"
 
 
@@ -2134,15 +2492,33 @@ def filter_personal_gains(df: pd.DataFrame, g_id) -> pd.DataFrame:
     return filtered.drop('G_ID', axis=1)
 
 
-def interpret_action_result(result_value: str | None, success_msg: str, failure_msg: str) -> str:
-    """Map a Firebase cloud-function 'result' value to a Discord message.
-    Shared by invite/kick, which used to duplicate this mapping independently.
+def pick_linked_character(rows: list[tuple]) -> tuple[str, str | None] | None:
+    """Which of an account's link rows !kick and !mygains act on, as (g_id, name).
+
+    `rows` are (g_id, g_name, in the guild in game) oldest first. Most link
+    rows are history, so the first one can be a character that left long ago:
+    the first still in the guild wins, falling back to the oldest usable row.
     """
-    if result_value is None:
-        return failure_msg
-    if result_value.lower() == "true":
-        return success_msg
-    return failure_msg
+    usable = [
+        (normalize_game_id(g_id), g_name, in_game)
+        for g_id, g_name, in_game in rows
+        if normalize_game_id(g_id) is not None
+    ]
+    if not usable:
+        return None
+    g_id, g_name, _ = next((row for row in usable if row[2]), usable[0])
+    return g_id, g_name
+
+
+def unique_by_id(items: list) -> list:
+    """items with repeats of the same .id dropped, order kept."""
+    seen = set()
+    unique = []
+    for item in items:
+        if item.id not in seen:
+            seen.add(item.id)
+            unique.append(item)
+    return unique
 
 
 def assign_error_message(error: Exception) -> str:
@@ -2205,37 +2581,92 @@ def is_unexpected_command_error(error: Exception) -> bool:
     )
 
 
-# The hour the weekly GP job runs, in the host's local time. Written once:
-# the loop needs a cheap gate it can apply on every tick without touching the
-# database, and should_run_weekly_gp needs the same condition, and those two
-# disagreeing silently would stop the job from ever running.
+# The hour the weekly GP job runs, in the host's local time.
 WEEKLY_GP_HOUR = 2
 
+# (seconds since Saturday 2 AM below which this row applies, retry every N
+# seconds) -- quick while an outage is likely to clear, then backing off, and
+# stopping at midnight. A retry later on Saturday can still be hours late, so
+# the report says how late; past Saturday, next week's run spreads the gap.
+WEEKLY_RETRY_SCHEDULE = (
+    (2 * 3600, 600),
+    (22 * 3600, 1800),
+)
 
-def is_weekly_gp_window(now: datetime) -> bool:
-    """Whether now falls in the weekly job's window: the 2 AM hour of a local
-    Saturday. The cheap half of the gate, with no persistence lookup."""
-    return is_saturday(now) and now.hour == WEEKLY_GP_HOUR
+# After the Saturday retries give up, the mod channel hears about a missing
+# snapshot this often until the next Saturday's run fills it in.
+SNAPSHOT_REMINDER_SECONDS = 24 * 3600
 
 
-def should_run_weekly_gp(now: datetime, already_ran: bool) -> bool:
-    """Whether the weekly GP job should fire on this tick.
+def weekly_window_opens(run_key: str) -> datetime:
+    """2 AM on the Saturday a snapshot column is named after."""
+    day = snapshot_date(run_key)
+    return datetime(day.year, day.month, day.day, WEEKLY_GP_HOUR)
 
-    The loop polls local time every 15 minutes rather than using
-    tasks.loop(time=...), because a naive time there is interpreted as UTC by
-    discord.py while this check and Functions.get_date() both work in local
-    time -- on a non-UTC host the two disagreed and the job ran hours from the
-    intended 2 AM.
 
-    already_ran must come from persistent storage, not a module global. Several
-    ticks land inside the 2 AM hour, and the bot can restart inside it too --
-    systemd runs it with Restart=on-failure -- so an in-memory marker is lost
-    exactly when it is needed and the whole cycle runs a second time. That is
-    the duplicate weekly report this loop exists to prevent.
+def weekly_retry_interval(since_opened: float) -> int | None:
+    for limit, interval in WEEKLY_RETRY_SCHEDULE:
+        if since_opened < limit:
+            return interval
+    return None
+
+
+def should_run_weekly_gp(now: datetime, snapshot_taken: bool, last_started_at: datetime | None) -> bool:
+    """Whether the weekly GP job should start on this tick.
+
+    The loop polls local time rather than using tasks.loop(time=...), because
+    a naive time there is interpreted as UTC by discord.py while this check and
+    Functions.get_date() both work in local time -- on a non-UTC host the two
+    disagreed and the job ran hours from the intended 2 AM.
+
+    Any time on Saturday from 2 AM, until the snapshot is taken: that covers a
+    failed run and a bot that was down at 2 AM alike. Retrying is safe because
+    GP_databases is one transaction, so "not taken" means nothing was written.
+
+    last_started_at must come from the database, not a module global: systemd
+    restarts the bot on a crash, and an in-memory time would let every restart
+    run the cycle again at once. abs() so a timestamp from a clock that was
+    wrong can't block retries for the rest of the day.
     """
-    if not is_weekly_gp_window(now):
+    if not is_saturday(now) or now.hour < WEEKLY_GP_HOUR or snapshot_taken:
         return False
-    return not already_ran
+    if last_started_at is None:
+        return True
+    opened = now.replace(hour=WEEKLY_GP_HOUR, minute=0, second=0, microsecond=0)
+    interval = weekly_retry_interval((now - opened).total_seconds())
+    if interval is None:
+        return False
+    return abs((now - last_started_at).total_seconds()) >= interval
+
+
+def snapshot_reminder_due(
+    now: datetime, run_key: str, snapshot_taken: bool, last_reminded_at: datetime | None,
+) -> bool:
+    """Whether to remind the mod channel that a week's snapshot is missing.
+
+    From the end of the Saturday retries, then once a day, until the week turns
+    over and that Saturday's run fills the gap. last_reminded_at comes from the
+    database for the same reason last_started_at does.
+    """
+    if snapshot_taken:
+        return False
+    retries_end = datetime.combine(snapshot_date(run_key) + timedelta(days=1), datetime.min.time())
+    if now < retries_end:
+        return False
+    if last_reminded_at is None:
+        return True
+    return abs((now - last_reminded_at).total_seconds()) >= SNAPSHOT_REMINDER_SECONDS
+
+
+BABA_PING_MINUTE = 57
+
+
+def baba_ping_due(now: datetime, last_pinged_at: datetime | None) -> bool:
+    """Whether the hourly spiketrap ping should go out on this tick. The loop
+    ticks more than once a minute, so one ping per hour needs the last one."""
+    if now.minute != BABA_PING_MINUTE:
+        return False
+    return last_pinged_at is None or abs((now - last_pinged_at).total_seconds()) >= 120
 
 
 def is_saturday(dt: datetime) -> bool:

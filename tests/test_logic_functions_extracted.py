@@ -191,6 +191,76 @@ class TestBuildGameMembersRows:
     def test_empty_dict(self):
         assert logic.build_game_members_rows({}) == []
 
+    def test_a_malformed_member_is_refused_by_validation_not_a_keyerror(self):
+        rows = logic.build_game_members_rows({'m1': {'a': 'Name1', 'e': 100}, 'm2': {'e': 5}, 'm3': None})
+        assert rows[1] == {'G_NAME': None, 'G_ID': 'm2', 'GP': 5}
+        assert rows[2] == {'G_NAME': None, 'G_ID': 'm3', 'GP': None}
+        assert logic.validate_roster_rows(rows, 0) == "a member has no name"
+
+
+class TestSplitMessage:
+    def test_a_short_message_is_untouched(self):
+        assert logic.split_message("hello") == ["hello"]
+
+    def test_every_part_fits_and_nothing_is_lost(self):
+        body = [f"line {index} " + "x" * 40 for index in range(120)]
+        text = "**Aetherians**\n```\n" + "\n".join(body) + "\n```"
+        parts = logic.split_message(text)
+        assert len(parts) > 1
+        assert all(len(part) <= logic.DISCORD_MESSAGE_LIMIT for part in parts)
+        kept = [line for part in parts for line in part.split("\n") if line.startswith("line ")]
+        assert kept == body
+
+    def test_a_cut_code_block_is_closed_and_reopened(self):
+        text = "head\n```\n" + "\n".join("y" * 50 for _ in range(100)) + "\n```"
+        for part in logic.split_message(text):
+            assert part.count("```") == 2
+
+    def test_one_overlong_line_is_cut(self):
+        parts = logic.split_message("z" * 5000)
+        assert all(len(part) <= logic.DISCORD_MESSAGE_LIMIT for part in parts)
+        assert "".join(parts).replace("\n", "") == "z" * 5000
+
+
+    def test_a_split_before_the_closing_fence_sends_no_empty_block(self):
+        room = logic.DISCORD_MESSAGE_LIMIT - 8
+        body = "x" * (room - len("```") - 2)
+        parts = logic.split_message("```\n" + body + "\n```\n" + "tail " * 10)
+        assert all(part.strip("`\n") for part in parts)
+        assert all(part.count("```") % 2 == 0 for part in parts)
+
+
+class TestKickOutcome:
+    def test_a_true_result_is_done(self):
+        assert logic.kick_outcome(200, {"result": "true"}) == logic.KICK_DONE
+
+    def test_a_false_result_is_a_refusal(self):
+        assert logic.kick_outcome(200, {"result": "false"}) == logic.KICK_REFUSED
+
+    def test_a_client_error_is_a_refusal(self):
+        assert logic.kick_outcome(401, {"error": {"status": "UNAUTHENTICATED"}}) == logic.KICK_REFUSED
+
+    def test_a_server_error_or_unreadable_reply_is_unknown(self):
+        """These used to read as "the game refused", leaving a member who may
+        have been kicked with every Discord role."""
+        assert logic.kick_outcome(502, None) == logic.KICK_UNKNOWN
+        assert logic.kick_outcome(500, {"error": "internal"}) == logic.KICK_UNKNOWN
+        assert logic.kick_outcome(200, None) == logic.KICK_UNKNOWN
+
+
+class TestFormatRoleSyncStatus:
+    def test_clean_sync_is_none(self):
+        assert logic.format_role_sync_status(None, []) is None
+
+    def test_failures_are_named_and_capped(self):
+        status = logic.format_role_sync_status(None, [f"m{index}: Forbidden" for index in range(7)])
+        assert status.startswith("7 role change(s) failed -- m0: Forbidden")
+        assert status.endswith("and 2 more")
+
+    def test_a_skipped_step_and_failures_are_both_reported(self):
+        status = logic.format_role_sync_status("duck pairing skipped", ["a: Forbidden"])
+        assert status == "duck pairing skipped; 1 role change(s) failed -- a: Forbidden"
+
 
 class TestRankThresholdConstants:
     """RANK_THRESHOLDS used to be duplicated across LedBotCode.py and

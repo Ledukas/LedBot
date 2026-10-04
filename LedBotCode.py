@@ -1,34 +1,25 @@
 import discord
-from discord import app_commands
 from discord.ext import commands, tasks
-from discord.ext.commands.bot import Bot
-import pandas as pd
 import sqlite3
 import os
 from dotenv import load_dotenv
 import requests
 import urllib3
-import shlex
-from datetime import datetime, timedelta, time
-import inspect
+from datetime import datetime
 import asyncio
-import random
 import sys
 import traceback
 import functools
-# Aliased: `time` is already taken above by datetime.time.
 from time import time as epoch_now
 
 import Functions
 import logic
-from scripts.backup_db import run_backup
+from scripts.backup_db import run_backup, run_manual_backup
 
 load_dotenv()
 
 TOKEN = os.environ.get('TOKEN')
 prefix = '!'
-GP_prefix = 'GP'
-separator = ' | '
 bot = commands.Bot(command_prefix=prefix, intents=discord.Intents.all())
 LedukasSpam_channelID = int(os.environ.get('SPAM_CHANNEL_ID'))
 # Resolved in on_ready. Defined here so the `is None` guards that read it are
@@ -50,8 +41,6 @@ conn.execute("PRAGMA journal_mode=WAL")
 
 # GP rank thresholds live in logic.RANK_THRESHOLDS (single source of truth).
 
-df_members_game = None
-
 roles_to_remove = {
     # Both guild roles plus every rank role, top one included. 'True Aetherian'
     # used to be omitted here, so a kicked top-rank member kept it while every
@@ -70,7 +59,13 @@ guilds_data = {
     for name, gid in logic.GUILD_GIDS.items()
 }
 
-# Load cogs
+# Load cogs. From setup_hook, which runs once: on_ready fires again on every
+# gateway reconnect, and each one logged every cog as failing to load.
+@bot.event
+async def setup_hook():
+    await load_cogs()
+
+
 async def load_cogs():
     cogs_path = "cogs"  # The directory where your cogs are stored
     for filename in os.listdir(cogs_path):
@@ -82,8 +77,6 @@ async def load_cogs():
             except Exception as e:
                 print(f"Failed to load cog {extension}: {e}")
 
-
-#pd.set_option('display.max_rows', None)  
 
 ##---------------------------------------------  Commands
 # a simple command to test if the bot is alive
@@ -144,7 +137,7 @@ async def gemdrop(ctx):
 async def export_data(ctx):
 
     try:
-        backup_path = run_backup()
+        backup_path = run_manual_backup()
         await ctx.send(f"Backup created: `{backup_path.name}`")
     except Exception as e:
         print(e)
@@ -197,7 +190,12 @@ def refresh_discord_rosters(guild_names=logic.GUILD_NAMES):
 @bot.command(name='members_game')
 @commands.has_role("Moderator")
 async def members_guild(ctx):
-    await export_game_rosters()
+    # Like !sync_counters: the weekly job reads {guild}_game after its export.
+    if Functions.weekly_job_depth:
+        await ctx.send("A weekly run is in progress -- try again once it has finished.")
+        return
+    async with roster_export_lock:
+        await export_game_rosters()
     await ctx.send("GP exported")
 
 
@@ -207,12 +205,13 @@ async def members_guild(ctx):
 roster_export_lock = asyncio.Lock()
 
 
-async def export_game_rosters(guild_names=logic.GUILD_NAMES):
+async def export_game_rosters(guild_names=logic.GUILD_NAMES, retry=False):
     # The same non-blocking roster read and cached login the invite poll uses.
     # This was pyrebase, which is synchronous and froze the whole bot --
     # the invite poll included -- for the length of the export.
+    # retry: a weekly retry, which stops signing in after a rejected password.
     for guild_name in guild_names:
-        rows = await fetch_guild_roster(guild_name)
+        rows = await fetch_guild_roster(guild_name, retry=retry)
         problem = logic.validate_roster_rows(rows, Functions.game_roster_size(guild_name))
         if problem:
             raise ValueError(f"the {guild_name} roster wasn't saved: {problem}")
@@ -249,32 +248,50 @@ def links_for(guild_name):
     return Functions.links_report(guild_name, bot.get_guild(809954021028134943))
 
 
+async def resolve_user(ctx, text):
+    """The Discord account a moderator typed, for !assign and !relink, or None.
+
+    MemberConverter handles a mention, a raw id, a name or name#discriminator
+    in one; the fetch_user fallback is what still resolves somebody who has
+    left the server, which is exactly the case a relink is usually fixing.
+    """
+    try:
+        return await commands.MemberConverter().convert(ctx, text)
+    except commands.BadArgument:
+        target_id = logic.normalize_discord_id(text)
+        if target_id is None:
+            return None
+        try:
+            return await bot.fetch_user(int(target_id))
+        except discord.NotFound:
+            return None
+
+
 #assign members in-game and discord
 @bot.command(name='assign')
 @commands.has_role("Moderator")
 async def assign(ctx, IOguild, user_param, game_name):
     
-    # Try to get user by ID
-    try:
-        user = await bot.fetch_user(int(user_param))
-    except ValueError:
-        # If the user_param is not a valid ID, try to get user by display name
-        user = discord.utils.find(lambda u: u.name == user_param or u.display_name == user_param, ctx.guild.members)
+    user = await resolve_user(ctx, user_param)
 
     if user:
-        
+
         if IOguild not in guilds_data:
             await ctx.send(f"'{IOguild}' is not one of our guilds. Use: {', '.join(guilds_data)}")
             return
 
-        input_string = ctx.message.content
-        args = shlex.split(input_string)
-        game_name = args[3]
+        # game_name is used as discord.py parsed it. It used to be re-parsed
+        # from the message with shlex, which raises on an apostrophe.
         table_name_members = logic.table_name(IOguild, 'members')
         table_name_game = logic.table_name(IOguild, 'game')
-        
+
         c = conn.cursor()
-        game = c.execute('SELECT * FROM ' + table_name_game + ' WHERE G_NAME = ?', (game_name,)).fetchone()
+        # Any capitalisation, like !invite and !relink; an exact match first.
+        game = c.execute(
+            'SELECT * FROM ' + table_name_game + ' WHERE G_NAME = ? COLLATE NOCASE '
+            'ORDER BY G_NAME = ? DESC',
+            (game_name, game_name),
+        ).fetchone()
         if game is None:
             await ctx.send(
                 f"No in-game member named '{game_name}' found in {IOguild}. "
@@ -294,7 +311,7 @@ async def assign(ctx, IOguild, user_param, game_name):
             f"WHERE m.G_ID = ?",
             (game[2],),
         ).fetchall()
-        blocked = logic.assign_block_message(IOguild, game_name, existing_links, user.id)
+        blocked = logic.assign_block_message(IOguild, game[1], existing_links, user.id)
         if blocked:
             await ctx.send(blocked)
             return
@@ -307,11 +324,9 @@ async def assign(ctx, IOguild, user_param, game_name):
         # resume to commit; the other write fails after 5 s.
         conn.commit()
 
-        await ctx.send(f"Assigned {game_name} to {user.display_name}, {user.id}")
+        await ctx.send(f"Assigned {game[1]} to {user.display_name}, {user.id}")
     else:
         await ctx.send("User not found.")
-        
-    conn.commit()
 
 
 HTTP_TIMEOUT = (5, 20)  # connect, read -- seconds
@@ -398,19 +413,23 @@ class FirebaseSignInError(Exception):
         self.permanent = permanent
 
 
-async def firebase_sign_in(IOguild, from_poll=False, force=False):
+async def firebase_sign_in(IOguild, from_poll=False, force=False, retry=False):
     """(gid, id token) for a guild's leader account, cached until near expiry.
 
     The poll backs off after a failure so it can't lock the account that !kick
     and the weekly export also sign into: ten minutes for a transient error, and
     indefinitely for a credentials error, which retrying can never fix. Manual
     commands always try, and a manual success lifts the pause.
+
+    A weekly retry shares only the indefinite pause: its own schedule spaces
+    it already, and a transient blip in one must not stall the other.
     """
     now = epoch_now()
     cached = _firebase_tokens.get(IOguild)
     if cached and not force and logic.token_is_fresh(now, cached[1]):
         return guilds_data[IOguild]["gid"], cached[0]
-    if from_poll and now < _poll_signin_paused_until.get(IOguild, 0):
+    paused_until = _poll_signin_paused_until.get(IOguild, 0)
+    if (from_poll and now < paused_until) or (retry and paused_until == float('inf')):
         raise FirebaseSignInError(
             f"signing in to {IOguild} is paused after an earlier failure", permanent=False
         )
@@ -437,6 +456,8 @@ async def firebase_sign_in(IOguild, from_poll=False, force=False):
     permanent = logic.classify_signin_error(message) == 'permanent'
     if from_poll:
         _poll_signin_paused_until[IOguild] = float('inf') if permanent else now + SIGNIN_RETRY_SECONDS
+    elif retry and permanent:
+        _poll_signin_paused_until[IOguild] = float('inf')
     raise FirebaseSignInError(logic.redact_secrets(message), permanent=permanent)
 
 
@@ -458,19 +479,19 @@ async def guild_login(ctx, IOguild):
         return None, None
 
 
-async def fetch_guild_roster(IOguild, from_poll=False):
+async def fetch_guild_roster(IOguild, from_poll=False, retry=False):
     """The live in-game roster, as logic.build_game_members_rows rows.
 
     Plain REST with the cached token, off the event loop. Used by the weekly
     export and !members_game as well as the invite poll, so there is one way to
     read a roster and one sign-in path.
     """
-    gid, token = await firebase_sign_in(IOguild, from_poll=from_poll)
+    gid, token = await firebase_sign_in(IOguild, from_poll=from_poll, retry=retry)
     url = ROSTER_URL.format(gid=gid)
     response = await get_json(url, params={"auth": token})
     if response.status_code == 401:
         # A token can be revoked before it expires. One fresh sign-in, then stop.
-        gid, token = await firebase_sign_in(IOguild, from_poll=from_poll, force=True)
+        gid, token = await firebase_sign_in(IOguild, from_poll=from_poll, force=True, retry=retry)
         response = await get_json(url, params={"auth": token})
     if response.status_code != 200:
         raise FirebaseRequestError(
@@ -482,7 +503,13 @@ async def fetch_guild_roster(IOguild, from_poll=False):
         payload = None
     if not isinstance(payload, dict):
         raise FirebaseRequestError(f"the {IOguild} roster came back empty", maybe_sent=False)
-    return logic.build_game_members_rows(payload)
+    rows = logic.build_game_members_rows(payload)
+    # Here, not only before the _game write: the invite poll and !invite match
+    # on these rows directly, and would link a member with no name.
+    problem = logic.validate_roster_rows(rows, 0) if rows else None
+    if problem:
+        raise FirebaseRequestError(f"the {IOguild} roster is malformed: {problem}", maybe_sent=False)
+    return rows
 
 
 #command to send an invite
@@ -630,6 +657,20 @@ async def uninvite(ctx, IOguild: str = None, *, name: str = None):
     Functions.set_invite_status(found['id'], logic.INVITE_CANCELLED)
     await ctx.send(logic.format_uninvite(IOguild, found), allowed_mentions=discord.AllowedMentions.none())
 
+def linked_character(cursor, IOguild, d_id):
+    """(g_id, name) of the character !kick and !mygains act on for a Discord
+    account, or None when it has no link row."""
+    table_members = logic.table_name(IOguild, 'members')
+    table_game = logic.table_name(IOguild, 'game')
+    rows = cursor.execute(
+        f"SELECT m.G_ID, m.G_NAME, "
+        f"EXISTS (SELECT 1 FROM {table_game} AS r WHERE r.G_ID = m.G_ID) "
+        f"FROM {table_members} AS m WHERE m.D_ID = ? ORDER BY m.rowid",
+        (d_id,),
+    ).fetchall()
+    return logic.pick_linked_character(rows)
+
+
 #command to kick from guild
 @bot.command(name='kick')
 @commands.has_role("Moderator")
@@ -641,16 +682,11 @@ async def kick(ctx, IOguild, KickID):
     if gid is None:
         return
 
-    # kick
-    table_name_members = logic.table_name(IOguild, 'members')
-    
-    c = conn.cursor()
-    c.execute(f"SELECT G_ID FROM {table_name_members} WHERE D_ID = ?", (KickID,))
-    resultUID = c.fetchall()
-    if not resultUID:
+    linked = linked_character(conn.cursor(), IOguild, KickID)
+    if linked is None:
         await ctx.send(f"No member with Discord ID {KickID} is assigned in {IOguild}.")
         return
-    resultUID = resultUID[0][0]
+    resultUID, Disp_result = linked
     guildData = {
         "data": {
             "uid": resultUID,
@@ -673,17 +709,24 @@ async def kick(ctx, IOguild, KickID):
         response = None
         kick_uncertain = True
 
-    payload = None
     if response is not None:
         try:
             payload = response.json()
         except ValueError:
             payload = None
-    result_value = logic.parse_action_result(payload)
-    c.execute(f"SELECT G_NAME FROM {table_name_members} WHERE D_ID = ?", (KickID,))
-    Disp_result = c.fetchall()
-    Disp_result = Disp_result[0][0]
-    
+        outcome = logic.kick_outcome(response.status_code, payload)
+        # A server error or an unreadable reply can follow a kick that went
+        # through, so it is handled like a timeout, not like a refusal.
+        kick_uncertain = outcome == logic.KICK_UNKNOWN
+    if not kick_uncertain and outcome != logic.KICK_DONE:
+        # The game refused, so they are still a member: the role cleanup below
+        # used to run anyway, under a message that only said "not kicked".
+        await ctx.send(
+            f"Error, {Disp_result} was not kicked from {IOguild} -- the game refused. "
+            f"Their Discord roles were left unchanged."
+        )
+        return
+
     # The in-game kick has already happened at this point. The Discord role
     # cleanup below is a separate step that can fail on its own, and it used to
     # fail into a bare print while the moderator was still told the kick had
@@ -713,14 +756,10 @@ async def kick(ctx, IOguild, KickID):
                 print(e)
                 role_warning = str(e)
 
-    message = logic.interpret_action_result(
-        result_value,
-        f"{Disp_result} has been kicked from {IOguild}",
-        "Error, not kicked",
-    )
+    message = f"{Disp_result} has been kicked from {IOguild}"
     if kick_uncertain:
         message = (
-            f"The game didn't answer in time, so {Disp_result} may or may not have been "
+            f"The game didn't confirm the kick, so {Disp_result} may or may not have been "
             f"kicked from {IOguild} -- check in game. Their Discord roles were updated as for a kick."
         )
     if role_warning:
@@ -736,17 +775,12 @@ async def mygains(ctx):
     
     c = conn.cursor()
     user_did = ctx.author.id
-    
-    # One message per guild the member belongs to, in GUILD_NAMES order. This
-    # was four hand-written branches covering every combination of two guilds.
-    memberships = []
-    for guild_name in logic.GUILD_NAMES:
-        c.execute(
-            f"SELECT * FROM {logic.table_name(guild_name, 'discord')} WHERE D_ID = ?",
-            (str(user_did),),
-        )
-        if c.fetchone() is not None:
-            memberships.append(guild_name)
+
+    # One message per guild the member belongs to, in GUILD_NAMES order. Asked
+    # of Discord, not {guild}_discord: that is only refreshed weekly, so
+    # someone given the role mid-week was told there was nothing for them.
+    held = {role.name for role in getattr(ctx.author, 'roles', ())}
+    memberships = [guild_name for guild_name in logic.GUILD_NAMES if guild_name in held]
 
     if not memberships:
         print("No GP gains recorded")
@@ -757,30 +791,27 @@ async def mygains(ctx):
         await ctx.send(await mygains2(guild_name, c, user_did))
 
 async def mygains2(IOguild, c, user_did):
-    
-    table_name_members = logic.table_name(IOguild, 'members')
+
     table_name_game = logic.table_name(IOguild, 'game')
-    
-    monthly_gp_df = await Functions.GP_dataframe(IOguild)
-    query = f"SELECT G_ID FROM {table_name_members} WHERE D_ID = ?"
-    c.execute(query, (user_did,))
-    user_gid = c.fetchall()
-    # mygains decides membership from {guild}_discord, which is a different
-    # population from {guild}_members: holding the Discord role does not mean
-    # anyone has linked an in-game name yet. sync_counters exists to list
-    # exactly these people, so this is a normal state, not a broken one.
-    if not user_gid:
+
+    linked = linked_character(c, IOguild, user_did)
+    # mygains decides membership from the Discord role, which is a different
+    # population from {guild}_members: holding the role does not mean anyone
+    # has linked an in-game name yet. sync_counters exists to list exactly
+    # these people, so this is a normal state, not a broken one.
+    if linked is None:
         return (
             f"You have the {IOguild} role but no in-game name linked yet -- "
             f"ask a moderator to run !assign for you."
         )
-    personal_gains = logic.filter_personal_gains(monthly_gp_df, user_gid[0][0])
+    user_gid = linked[0]
+    monthly_gp_df = await Functions.GP_dataframe(IOguild)
+    personal_gains = logic.filter_personal_gains(monthly_gp_df, user_gid)
     # Header uses the guild name in place of the first column's real name
     # (e.g. "Name"), matching the original formatting exactly.
     personal_gains = personal_gains.rename(columns={personal_gains.columns[0]: IOguild})
     table_block = logic.format_table_block(personal_gains)
 
-    user_gid = str(user_gid[0][0])
     query = f"SELECT GP FROM {table_name_game} WHERE G_ID = ?"
     c.execute(query, (user_gid,))
     user_gp = c.fetchall()
@@ -803,7 +834,9 @@ async def mygains2(IOguild, c, user_did):
 @bot.command(name='promotions')
 @commands.has_role("Moderator")
 async def promotions(ctx):
-    await Functions.promotions(bot, LedukasSpam_channel)
+    # Falls back to where it was asked: with the mod channel not cached there
+    # was nowhere to post, not even the error.
+    await Functions.promotions(bot, LedukasSpam_channel or ctx.channel)
 
 @bot.command(name='whois')
 @commands.has_role("Moderator")
@@ -856,19 +889,7 @@ async def relink(ctx, character: str = None, *, member: str = None):
         return
     guild_name, g_id = resolved
 
-    # MemberConverter handles a mention, a raw id, a name or name#discriminator
-    # in one; the fetch_user fallback is what still resolves somebody who has
-    # left the server, which is exactly the case a relink is usually fixing.
-    user = None
-    try:
-        user = await commands.MemberConverter().convert(ctx, member)
-    except commands.BadArgument:
-        target_id = logic.normalize_discord_id(member)
-        if target_id is not None:
-            try:
-                user = await bot.fetch_user(int(target_id))
-            except discord.NotFound:
-                user = None
+    user = await resolve_user(ctx, member)
     if user is None:
         await ctx.send(f"Could not find a Discord user matching '{member}'.")
         return
@@ -914,29 +935,35 @@ async def send_guild_sections(ctx, IOguild, build, clean_text, leading=()):
     await send_embeds(ctx, embeds, "\n".join(clean) or None)
 
 #baba pings
+# A tasks.loop like the other two: the bare create_task this used to be had no
+# reference kept, and asyncio only holds tasks weakly.
+_baba_last_ping = None
+
+
+@tasks.loop(seconds=40)
 async def baba_ping():
-    while True:
-        try:
-            now = datetime.now()
-            if now.minute == 57:
-                guild = bot.get_guild(809954021028134943)
-                baba_role = discord.utils.get(guild.roles, name="Spiketrap") if guild else None
-                baba_channel = bot.get_channel(1032916681569349632)
-                if guild and baba_role and baba_channel:
-                    await baba_channel.send(f"{baba_role.mention} The spiketrap is awaiting your death!")
-                else:
-                    print("baba_ping: guild/role/channel not found, skipping this hour")
-                await asyncio.sleep(100)
-            else:
-                await asyncio.sleep(40)
-        except Exception as e:
-            # Never let a transient failure (rate limit, cache gap, etc.) kill this loop
-            # permanently -- log it and keep going instead of letting the task die silently.
-            print(f"baba_ping error: {e}")
-            await asyncio.sleep(40)
+    global _baba_last_ping
+    # tasks.loop stops for good after an unhandled exception (rate limit,
+    # cache gap, etc.) -- log it and keep going instead.
+    try:
+        now = datetime.now()
+        if not logic.baba_ping_due(now, _baba_last_ping):
+            return
+        # Marked before sending, so a failure skips this hour rather than
+        # retrying inside the same minute.
+        _baba_last_ping = now
+        guild = bot.get_guild(809954021028134943)
+        baba_role = discord.utils.get(guild.roles, name="Spiketrap") if guild else None
+        baba_channel = bot.get_channel(1032916681569349632)
+        if guild and baba_role and baba_channel:
+            await baba_channel.send(f"{baba_role.mention} The spiketrap is awaiting your death!")
+        else:
+            print("baba_ping: guild/role/channel not found, skipping this hour")
+    except Exception as e:
+        print(f"baba_ping error: {e}")
 
 #does weekly GP things
-async def run_weekly_gp(ack_channel=None):
+async def run_weekly_gp(ack_channel=None, run_key=None, retry=False):
     """Run the weekly cycle with the invite poll held off {guild}_game.
 
     Wraps the whole cycle, not just the reporting part: the window that matters
@@ -945,7 +972,7 @@ async def run_weekly_gp(ack_channel=None):
     """
     with Functions.weekly_job():
         try:
-            await _run_weekly_gp(ack_channel)
+            await _run_weekly_gp(ack_channel, run_key, retry)
         finally:
             # Not reached when the process dies mid-cycle: on_ready then finds
             # the run unended and says its report was lost.
@@ -960,10 +987,10 @@ class WeeklyReportIncomplete(Exception):
     which is why it must not be answered with a full !GP_weekly re-run."""
 
 
-async def _run_weekly_gp(ack_channel):
+async def _run_weekly_gp(ack_channel, run_key=None, retry=False):
     """One weekly GP cycle: refresh in-game GP, roll this week's snapshot
-    columns, reassign rank roles, report low-GP members, implausible gains and
-    link problems, and back up the DB.
+    columns, check them, reassign rank roles, report low-GP members,
+    implausible gains and link problems, and back up the DB.
 
     Everything is posted to the mod channel as one report, at the end, so the
     weekly history stays in one place no matter where !GP_weekly was typed.
@@ -973,26 +1000,42 @@ async def _run_weekly_gp(ack_channel):
     """
     print("Starting weekly GP process")
 
-    # Mark the week before doing any work, so a restart mid-cycle cannot run it
-    # again, and so a manual !GP_weekly suppresses the scheduled run.
-    run_key = (await Functions.get_date())["column_name1"]
-    await Functions.mark_weekly_run_started(run_key)
+    # Mark the attempt before doing any work: the loop spaces its retries from
+    # this, so a restart mid-cycle cannot run it again straight away.
+    if run_key is None:
+        run_key = (Functions.get_date())["column_name1"]
+    started_at = datetime.now()
+    await Functions.mark_weekly_run_started(run_key, started_at)
 
     async with roster_export_lock:
-        await export_game_rosters()
-        await Functions.GP_databases()
+        await export_game_rosters(retry=retry)
+        await Functions.GP_databases(run_key)
 
     report = []
     failure = None
+    snapshot_note = None
+    # The sections read the snapshot's own week, not whichever week it is by
+    # the time they run -- a run can cross midnight into a Saturday.
+    week_day = logic.weekly_window_opens(run_key)
     try:
+        # First, so a problem with the data itself opens the report, and with
+        # no await since the lock: nothing has rewritten _game in between, and
+        # the poll, !members_game and !sync_counters all stand aside while
+        # weekly_job() is held.
+        try:
+            warnings, snapshot_note = snapshot_section(run_key, started_at)
+            report.extend(warnings)
+        except Exception as e:
+            failure = _record_failure(report, "Snapshot check failed", e)
         # After the snapshot, not between it and the export: weekly_job()
         # keeps that window short, and GP_databases doesn't read this.
         try:
             report.extend(refresh_discord_rosters()[0])
         except Exception as e:
-            failure = _record_failure(report, "Role lists not refreshed", e)
+            error = _record_failure(report, "Role lists not refreshed", e)
+            failure = failure or error
         for guild_name in logic.GUILD_NAMES:
-            guild_failure = await collect_guild_report(guild_name, report, sync_roles=True)
+            guild_failure = await collect_guild_report(guild_name, report, sync_roles=True, today=week_day)
             if failure is None:
                 failure = guild_failure
         #await Functions.promotions(bot, LedukasSpam_channel)
@@ -1012,7 +1055,7 @@ async def _run_weekly_gp(ack_channel):
             print(e)
             report.append(logic.failure_embed("Weekly backup failed", e))
         content, embeds = logic.finish_weekly_report(
-            logic.weekly_report_heading(run_key), report, backup_name
+            logic.weekly_report_heading(run_key), report, backup_name, snapshot_note
         )
         # Nothing in this finally may raise: an exception here would replace the
         # one that brought us into it and hide why the cycle actually failed.
@@ -1077,17 +1120,65 @@ def _record_failure(report, title, error):
     return error
 
 
+def snapshot_section(run_key, started_at=None, checks=True):
+    """(warning embeds, footer note) for a week's snapshot.
+
+    checks=False is !weekly_report's view: only which weeks were estimated,
+    since that is a fact about the stored data. The coverage and zero-share
+    checks compare against {guild}_game, which the invite poll keeps refreshing
+    after Saturday, so outside the weekly job they would raise false alarms.
+    """
+    statuses = [
+        Functions.snapshot_status(guild_name, run_key, counts=checks) for guild_name in logic.GUILD_NAMES
+    ]
+    embeds = []
+    if checks:
+        retake_possible = datetime.now().date() == logic.snapshot_date(run_key)
+        for status in statuses:
+            problems = logic.snapshot_problems(status, retake_possible)
+            if problems:
+                embeds.append(logic.warning_embed(
+                    f"{status['guild']} -- snapshot check", "\n".join(problems)
+                ))
+    estimated = logic.format_estimated_weeks(statuses)
+    if estimated:
+        embeds.append(logic.warning_embed("Missed weeks estimated", estimated))
+    if not checks:
+        return embeds, None
+    return embeds, logic.format_snapshot_note(statuses, logic.snapshot_lateness(run_key, started_at))
+
+
 @bot.command(name='GP_weekly')
 @commands.has_role("Moderator")
-async def GP_weekly_man(ctx):
+async def GP_weekly_man(ctx, option: str = None):
+    if option not in (None, "force"):
+        await ctx.send("Usage: !GP_weekly [force]")
+        return
     if Functions.weekly_job_depth:
         await ctx.send("A weekly run is already in progress.")
         return
-    await ctx.send(f"Weekly run started -- the report will be posted in <#{LedukasSpam_channelID}>.")
-    try:
-        await run_weekly_gp(ctx)
-    except WeeklyReportIncomplete as e:
-        await ctx.send(logic.format_weekly_incomplete(str(e)))
+    today = datetime.now()
+    run_key = (Functions.get_date(today))["column_name1"]
+    if option is None and not logic.is_saturday(today):
+        # Mid-week this would store today's totals as Saturday's snapshot,
+        # unlabelled, and overwrite Saturday's if it was taken.
+        await ctx.send(logic.format_gp_weekly_refused(Functions.snapshot_taken(run_key)))
+        return
+    # Entered before the first await that yields, so a retry tick can't start
+    # a second cycle while the "started" reply is in flight. The counter nests.
+    with Functions.weekly_job():
+        await ctx.send(f"Weekly run started -- the report will be posted in <#{LedukasSpam_channelID}>.")
+        try:
+            await run_weekly_gp(ctx, run_key)
+        except WeeklyReportIncomplete as e:
+            await ctx.send(logic.format_weekly_incomplete(str(e)))
+        except Exception as e:
+            # Caught so the mod sees why rather than on_command_error's generic
+            # line -- which means logging it here, as that handler would have.
+            traceback.print_exception(type(e), e, e.__traceback__)
+            await ctx.send(logic.format_manual_weekly_failure(
+                logic.redact_secrets(e), Functions.snapshot_taken(run_key)
+            ))
 
 
 @bot.command(name='weekly_report')
@@ -1095,14 +1186,8 @@ async def GP_weekly_man(ctx):
 async def weekly_report(ctx):
     """The latest week's report again, here, without running anything: no
     export, no snapshot, no role changes, no backup."""
-    today = datetime.today()
-    run_key = (await Functions.get_date(today))["column_name1"]
-    if not Functions.snapshot_taken(run_key):
-        # Saturday before the 2 AM run, or after a run that failed before
-        # GP_databases: this week has no column yet, so show the last one.
-        today -= timedelta(days=7)
-        run_key = (await Functions.get_date(today))["column_name1"]
-    report = []
+    today, run_key = await Functions.latest_snapshot_day()
+    report, _ = snapshot_section(run_key, checks=False)
     for guild_name in logic.GUILD_NAMES:
         await collect_guild_report(guild_name, report, sync_roles=False, today=today)
     content, embeds = logic.finish_weekly_report(
@@ -1113,42 +1198,86 @@ async def weekly_report(ctx):
 
 ##---------------------------------------------  Functions
 
-# Ticks every 15 minutes and acts only in the 2 AM hour on a local-time
-# Saturday. It does NOT use tasks.loop(time=...): a naive datetime.time there is
-# interpreted as UTC by discord.py, while this guard and Functions.get_date()
-# both work in local time, so on any machine not set to UTC the two disagreed
-# and the job ran hours away from the intended 2 AM -- on a UTC-5 host, Saturday
-# 21:00 local. Polling local time keeps the schedule consistent with the dates
-# the snapshot columns are named after, and stays correct across DST, which a
-# fixed UTC offset captured at import would not.
+# Ticks every 5 minutes. It does NOT use tasks.loop(time=...): a naive
+# datetime.time there is interpreted as UTC by discord.py, while this guard and
+# Functions.get_date() both work in local time, so on any machine not set to
+# UTC the two disagreed and the job ran hours away from the intended 2 AM -- on
+# a UTC-5 host, Saturday 21:00 local. Polling local time keeps the schedule
+# consistent with the dates the snapshot columns are named after, and stays
+# correct across DST, which a fixed UTC offset captured at import would not.
 #
-# The weekly_runs marker that run_weekly_gp writes makes the several ticks
-# inside the 2 AM hour, and a restart within it, run the job once.
-# tasks.loop is still what runs it, for its start()/is_running() lifecycle: a
-# gateway reconnect re-firing on_ready cannot spawn a second copy, which is what
-# used to send the weekly report twice.
-@tasks.loop(minutes=15)
+# From 2 AM Saturday it runs the job until the week's snapshot is taken,
+# retrying on logic.WEEKLY_RETRY_SCHEDULE until midnight; after that it reminds
+# the mod channel daily until the next Saturday's run fills the gap. Both are
+# timed from weekly_runs in the database, so a crash-restart neither retries
+# early nor repeats a reminder. tasks.loop is still what runs it, for its
+# start()/is_running() lifecycle: a gateway reconnect re-firing on_ready cannot
+# spawn a second copy, which is what used to send the weekly report twice.
+@tasks.loop(minutes=5)
 async def gp_weekly_loop():
-    now = datetime.now()
-    if not logic.is_weekly_gp_window(now):
-        return
-
-    if LedukasSpam_channel is None:
-        # Return before marking the week so a later tick can still run it once
-        # the channel is cached.
-        print("gp_weekly_loop: mod channel not available, skipping this tick", file=sys.stderr)
-        return
-
-    run_key = (await Functions.get_date())["column_name1"]
-    if not logic.should_run_weekly_gp(now, await Functions.weekly_run_already_started(run_key)):
-        return
-
-    # Without this, any exception escaping run_weekly_gp stops the task for
-    # good -- discord.ext.tasks does not reschedule after an unhandled error --
-    # and the only sign would be a missing weekly report. Same permanent-death
-    # mode baba_ping was hardened against.
+    # tasks.loop stops for good after an unhandled exception, and this now
+    # reads the database every tick of the week, not just in the 2 AM hour.
     try:
-        await run_weekly_gp()
+        await gp_weekly_tick()
+    except Exception as e:
+        print(f"weekly GP tick failed: {logic.redact_secrets(e)}", file=sys.stderr)
+        traceback.print_exception(type(e), e, e.__traceback__)
+
+
+async def gp_weekly_tick():
+    if Functions.weekly_job_depth:
+        return
+    now = datetime.now()
+    run_key = (Functions.get_date(now))["column_name1"]
+    taken = Functions.snapshot_taken(run_key)
+    started_at, reminded_at = Functions.weekly_run_times(run_key)
+
+    if logic.should_run_weekly_gp(now, taken, started_at):
+        if LedukasSpam_channel is None:
+            # Return before marking the attempt so a later tick can still run
+            # it once the channel is cached.
+            print("gp_weekly_loop: mod channel not available, skipping this tick", file=sys.stderr)
+            return
+        await scheduled_weekly_run(run_key, first_attempt=started_at is None)
+    elif logic.snapshot_reminder_due(now, run_key, taken, reminded_at):
+        if LedukasSpam_channel is None:
+            return
+        # Marked first: if the send fails, a missed reminder beats one that
+        # repeats on every tick.
+        Functions.mark_snapshot_reminded(run_key, now)
+        await report_to_mods(logic.format_snapshot_reminder(
+            run_key, started_at is not None, _weekly_last_error.get(run_key),
+            login_rejected(),
+        ))
+
+
+# run_key -> the last scheduled attempt's error, for the reminder. In memory:
+# after a restart the reminder just leaves the error out.
+_weekly_last_error = {}
+
+
+def login_rejected():
+    """Whether a rejected password has paused signing in, and with it the
+    weekly retries, until the bot restarts with a fixed .env."""
+    return any(_poll_signin_paused_until.get(guild) == float('inf') for guild in logic.GUILD_NAMES)
+
+
+async def scheduled_weekly_run(run_key, first_attempt):
+    """One scheduled attempt. Only the first failure of the week is posted --
+    it says retries follow -- and later ones are logged, so a Saturday-long
+    outage doesn't post every ten minutes.
+
+    Retries stop signing in once a password is rejected (shared with the invite
+    poll), rather than every retry adding a failed login to the account !kick
+    shares.
+
+    Without the broad except, any exception escaping run_weekly_gp stops the
+    task for good -- discord.ext.tasks does not reschedule after an unhandled
+    error -- and the only sign would be a missing weekly report. Same
+    permanent-death mode baba_ping was hardened against.
+    """
+    try:
+        await run_weekly_gp(run_key=run_key, retry=not first_attempt)
     except WeeklyReportIncomplete as e:
         # Its traceback was already logged where it happened.
         print(f"weekly GP job finished with errors: {e}", file=sys.stderr)
@@ -1157,12 +1286,17 @@ async def gp_weekly_loop():
         except Exception as send_error:
             print(f"could not report weekly GP errors: {send_error}", file=sys.stderr)
     except Exception as e:
-        print(f"weekly GP job failed: {e}", file=sys.stderr)
+        detail = logic.redact_secrets(e)
+        print(f"weekly GP job failed: {detail}", file=sys.stderr)
         traceback.print_exception(type(e), e, e.__traceback__)
+        _weekly_last_error[run_key] = detail
+        if not first_attempt:
+            return
         try:
             await LedukasSpam_channel.send(
-                f"Weekly GP job failed: {e}. It will not retry automatically -- "
-                f"run !GP_weekly once the cause is fixed."
+                logic.format_weekly_failure(
+                    detail, retrying=not Functions.snapshot_taken(run_key), now=datetime.now()
+                )
             )
         except Exception as send_error:
             print(f"could not report weekly GP failure: {send_error}", file=sys.stderr)
@@ -1457,31 +1591,29 @@ async def on_command_error(ctx, error):
         await ctx.send(message)
 
         
-baba_task = None
 # gives a message in console once the bot goes live
 @bot.event
 async def on_ready():
-    global baba_task
     print(f'Logged in with {bot.user.name} | {bot.user.id}')
-    if baba_task is None:
-        baba_task = 1
-        bot.loop.create_task(baba_ping())
+    if not baba_ping.is_running():
+        baba_ping.start()
     global LedukasSpam_channel
     LedukasSpam_channel = bot.get_channel(LedukasSpam_channelID)
     if LedukasSpam_channel is None:
         print(f"WARNING: mod channel {LedukasSpam_channelID} not found; the weekly GP job cannot report")
     # Started only after the channel it writes to is resolved: an interval loop
     # runs its body immediately on start().
-    if not gp_weekly_loop.is_running():
-        gp_weekly_loop.start()
     if not invite_poll_loop.is_running():
         invite_poll_loop.start()
+    # Before the weekly loop starts, but not the invite poll: this awaits a
+    # send before marking the old run ended, and a retry starting in between
+    # would have its own fresh marker stamped as ended too.
+    await report_interrupted_weekly_run()
+    if not gp_weekly_loop.is_running():
+        gp_weekly_loop.start()
     if None in (WELCOME_POST_CHANNEL_ID, WELCOME_INFO_CHANNEL_ID, ROLES_CHANNEL_ID):
         print("WARNING: welcome channel ids are not all set in .env; invite auto-link "
               "will link and give roles but skip the welcome", file=sys.stderr)
-
-    await load_cogs()
-    await report_interrupted_weekly_run()
 
 
 async def report_interrupted_weekly_run():
@@ -1492,7 +1624,17 @@ async def report_interrupted_weekly_run():
     try:
         interrupted = Functions.interrupted_weekly_run()
         if interrupted is not None:
-            await report_to_mods(logic.format_interrupted_weekly_run(*interrupted))
+            run_key, started_at, attempts = interrupted
+            taken = Functions.snapshot_taken(run_key)
+            retrying = datetime.now().date() == logic.snapshot_date(run_key) and not login_rejected()
+            if attempts > 1 and retrying and not taken:
+                # A retry that died the same way: like a failed retry, logged
+                # only, so a crash on every attempt isn't a notice per restart.
+                print(f"weekly run {run_key} interrupted again (attempt {attempts})", file=sys.stderr)
+            else:
+                await report_to_mods(logic.format_interrupted_weekly_run(
+                    run_key, started_at, snapshot_taken=taken, retrying=retrying,
+                ))
             Functions.mark_weekly_runs_ended()
     except Exception as e:
         print(f"could not check for an interrupted weekly run: {e}", file=sys.stderr)

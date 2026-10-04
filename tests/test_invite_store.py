@@ -409,6 +409,37 @@ class TestSignIn:
         assert not failure.value.permanent
         assert mod._poll_signin_paused_until[GUILD] < float('inf')
 
+    def test_a_weekly_retry_neither_sets_nor_obeys_the_brief_pause(self, bot_module, monkeypatch):
+        """A blip in the weekly retry mustn't stall the invite poll, nor a poll
+        blip the retry -- the retry schedule spaces it already."""
+        mod = bot_module.module
+        seen = self.calls(
+            bot_module, monkeypatch,
+            FakeResponse({'error': {'message': "TOO_MANY_ATTEMPTS_TRY_LATER"}}, 400),
+            FakeResponse({'error': {'message': "TOO_MANY_ATTEMPTS_TRY_LATER"}}, 400),
+            FakeResponse({'error': {'message': "TOO_MANY_ATTEMPTS_TRY_LATER"}}, 400),
+        )
+        with pytest.raises(mod.FirebaseSignInError):
+            asyncio.run(mod.firebase_sign_in(GUILD, retry=True))
+        assert GUILD not in mod._poll_signin_paused_until
+        with pytest.raises(mod.FirebaseSignInError):
+            asyncio.run(mod.firebase_sign_in(GUILD, from_poll=True))
+        with pytest.raises(mod.FirebaseSignInError):
+            asyncio.run(mod.firebase_sign_in(GUILD, retry=True))
+        assert len(seen) == 3
+
+    def test_a_weekly_retry_shares_the_bad_password_pause(self, bot_module, monkeypatch):
+        mod = bot_module.module
+        seen = self.calls(bot_module, monkeypatch, FakeResponse({'error': {'message': "INVALID_PASSWORD"}}, 400))
+        with pytest.raises(mod.FirebaseSignInError):
+            asyncio.run(mod.firebase_sign_in(GUILD, retry=True))
+        assert mod._poll_signin_paused_until[GUILD] == float('inf')
+        with pytest.raises(mod.FirebaseSignInError):
+            asyncio.run(mod.firebase_sign_in(GUILD, retry=True))
+        with pytest.raises(mod.FirebaseSignInError):
+            asyncio.run(mod.firebase_sign_in(GUILD, from_poll=True))
+        assert len(seen) == 1
+
 
 class TestRequestErrors:
     def raise_from_get(self, monkeypatch, exc_type):

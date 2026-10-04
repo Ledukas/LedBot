@@ -297,7 +297,7 @@ class TestExportValidation:
         """Firebase returning {} passes fetch_guild_roster's dict check."""
         Functions.write_game_roster(GUILD, [{'G_ID': "A", 'G_NAME': "Alpha", 'GP': 1}])
 
-        async def empty(guild_name, from_poll=False):
+        async def empty(guild_name, from_poll=False, retry=False):
             return []
         monkeypatch.setattr(bot, "fetch_guild_roster", empty)
         with pytest.raises(ValueError, match="came back empty"):

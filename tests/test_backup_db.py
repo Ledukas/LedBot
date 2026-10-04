@@ -134,3 +134,57 @@ class TestMain:
         assert exit_code == 0
         # 3 pre-existing + 1 new = 4, retention=1 keeps only the newest.
         assert len(list(backups_dir.glob("DatabaseLedBot_*.db"))) == 1
+
+
+class TestRunBackupPrunes:
+    def test_run_backup_prunes_to_retention(self, tmp_sqlite_db, tmp_path):
+        """The bot only calls run_backup, so pruning left to main() never
+        happened on the Pi."""
+        backups_dir = tmp_path / "Backups"
+        backups_dir.mkdir()
+        for index in range(3):
+            old = backups_dir / f"{backup_db.DB_STEM}_2020-01-0{index + 1}_000000.db"
+            old.write_bytes(b"")
+            os.utime(old, (index, index))
+
+        newest = backup_db.run_backup(tmp_sqlite_db, backups_dir, retention=2)
+
+        remaining = sorted(path.name for path in backups_dir.iterdir())
+        assert newest.name in remaining
+        assert len(remaining) == 2
+
+    def test_retention_none_keeps_everything(self, tmp_sqlite_db, tmp_path):
+        backups_dir = tmp_path / "Backups"
+        backups_dir.mkdir()
+        (backups_dir / f"{backup_db.DB_STEM}_2020-01-01_000000.db").write_bytes(b"")
+
+        backup_db.run_backup(tmp_sqlite_db, backups_dir, retention=None)
+
+        assert len(list(backups_dir.iterdir())) == 2
+
+
+class TestManualBackups:
+    def test_manual_backups_do_not_count_against_the_weekly_ones(self, tmp_sqlite_db, tmp_path):
+        """A burst of !relink safety backups used to push weekly ones out."""
+        backups_dir = tmp_path / "Backups"
+        backups_dir.mkdir()
+        weekly = backup_db.run_backup(tmp_sqlite_db, backups_dir, retention=1)
+        for index in range(backup_db.MANUAL_RETENTION + 3):
+            old = backups_dir / f"{backup_db.MANUAL_STEM}_2020-01-01_0000{index:02}.db"
+            old.write_bytes(b"")
+            os.utime(old, (index, index))
+
+        manual = backup_db.run_manual_backup(tmp_sqlite_db, backups_dir)
+
+        assert weekly.exists()
+        assert manual.name.startswith(backup_db.MANUAL_STEM + "_")
+        assert len(list(backups_dir.glob(f"{backup_db.MANUAL_STEM}_*.db"))) == backup_db.MANUAL_RETENTION
+
+    def test_weekly_pruning_leaves_manual_backups(self, tmp_sqlite_db, tmp_path):
+        backups_dir = tmp_path / "Backups"
+        backups_dir.mkdir()
+        manual = backup_db.run_manual_backup(tmp_sqlite_db, backups_dir)
+
+        backup_db.prune_old_backups(backups_dir, retention=0)
+
+        assert manual.exists()

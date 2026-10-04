@@ -78,3 +78,13 @@ class TestResolveGiveawayArgsGuildValidation:
     def test_every_real_guild_is_accepted(self):
         for name in logic.GUILD_NAMES:
             assert logic.resolve_giveaway_args(name, 0) == (name, 0)
+
+
+class TestUniqueById:
+    def test_repeats_are_dropped_and_order_kept(self):
+        """A member with two qualifying characters was entered twice."""
+        a, b = SimpleNamespace(id=1), SimpleNamespace(id=2)
+        assert logic.unique_by_id([a, b, SimpleNamespace(id=1)]) == [a, b]
+
+    def test_empty(self):
+        assert logic.unique_by_id([]) == []

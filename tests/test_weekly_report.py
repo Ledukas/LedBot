@@ -229,7 +229,7 @@ class TestBuilders:
         isolation and cost the other guild its report."""
         def broken(*args, **kwargs):
             raise ValueError("unexpected value")
-        monkeypatch.setattr(Functions, "_load_gp_series", lambda guild: {})
+        monkeypatch.setattr(Functions, "_load_gp_series", lambda guild: ({}, set()))
         monkeypatch.setattr(Functions, "_load_link_snapshot", lambda guild: ([], {}, {}))
         monkeypatch.setattr(Functions, "_load_role_holders", lambda guild: {})
         monkeypatch.setattr(logic, "format_gp_audit", broken)
@@ -284,7 +284,7 @@ def weekly(temp_functions_db, no_bot_run, monkeypatch, tmp_path):
     mod = FakeChannel()
     calls = []
 
-    async def get_date(today=None):
+    def get_date(today=None):
         return {"column_name1": WEEK}
 
     def step(name):
@@ -310,21 +310,43 @@ def weekly(temp_functions_db, no_bot_run, monkeypatch, tmp_path):
             return state.sections.get(f"{kind}:{guild}", [])
         return builder
 
+    async def export(guild_names=logic.GUILD_NAMES, retry=False):
+        calls.append("export")
+        state.export_retry.append(retry)
+        if state.export_error is not None:
+            raise state.export_error
+
+    async def gp_databases(run_key=None, db_path=None):
+        calls.append("GP_databases")
+        state.taken.add(run_key)
+
+    def snapshot_status(guild, run_key, counts=True):
+        status = {
+            'guild': guild, 'column': run_key, 'previous': None, 'missed': [], 'present': True,
+            'roster': 1, 'recorded': 1, 'zeros': 0, 'negatives': 0,
+        }
+        status.update(state.snapshot.get(guild, {}))
+        return status
+
     state = SimpleNamespace(
         mod=mod, calls=calls, sections={}, dataframe_days=[], discord_warnings=[], module=LedBotCode,
+        taken={WEEK}, snapshot={}, export_error=None, export_retry=[],
     )
     monkeypatch.setattr(LedBotCode, "LedukasSpam_channel", mod)
     monkeypatch.setattr(LedBotCode, "LedukasSpam_channelID", MOD_CHANNEL_ID)
     # A contended lock binds to its event loop, and each test runs its own.
     monkeypatch.setattr(LedBotCode, "roster_export_lock", asyncio.Lock())
-    monkeypatch.setattr(LedBotCode, "export_game_rosters", step("export"))
+    monkeypatch.setattr(LedBotCode, "export_game_rosters", export)
     monkeypatch.setattr(LedBotCode, "refresh_discord_rosters", refresh_discord_rosters)
     monkeypatch.setattr(LedBotCode, "run_backup", lambda: Path("Backups/Database_2026_10_03.db"))
+    monkeypatch.setattr(LedBotCode, "_weekly_last_error", {})
+    monkeypatch.setattr(LedBotCode, "_poll_signin_paused_until", {})
     monkeypatch.setattr(Functions, "get_date", get_date)
-    monkeypatch.setattr(Functions, "GP_databases", step("GP_databases"))
+    monkeypatch.setattr(Functions, "GP_databases", gp_databases)
     monkeypatch.setattr(Functions, "GP_dataframe", gp_dataframe)
     monkeypatch.setattr(Functions, "GP_roles", gp_roles)
-    monkeypatch.setattr(Functions, "snapshot_taken", lambda column: True)
+    monkeypatch.setattr(Functions, "snapshot_taken", lambda column: column in state.taken)
+    monkeypatch.setattr(Functions, "snapshot_status", snapshot_status)
     monkeypatch.setattr(Functions, "red_gp_report", build("red"))
     monkeypatch.setattr(Functions, "gp_audit_report", build("audit"))
     monkeypatch.setattr(Functions, "links_report", build("links"))
@@ -332,11 +354,16 @@ def weekly(temp_functions_db, no_bot_run, monkeypatch, tmp_path):
 
 
 def run(state, ack=None):
-    asyncio.run(state.module.run_weekly_gp(ack))
+    # At the run's own 2 AM, so the snapshot note has no lateness in it.
+    with freeze_time("2026-10-03 02:00:00"):
+        asyncio.run(state.module.run_weekly_gp(ack))
 
 
 async def role_sync_crash(bot, df):
     raise RuntimeError("503 Service Unavailable")
+
+
+SNAPSHOT_NOTE = "Snapshot: Aetherians 1/1, Pretherians 1/1"
 
 
 class TestWeeklyRun:
@@ -345,7 +372,7 @@ class TestWeeklyRun:
         [(content, kwargs)] = weekly.mod.sent
         assert content == (
             "**Weekly report -- week ending 10/3** -- nothing to report. "
-            "Backup: `Database_2026_10_03.db`"
+            f"{SNAPSHOT_NOTE}. Backup: `Database_2026_10_03.db`"
         )
         assert kwargs['embeds'] == []
 
@@ -357,8 +384,33 @@ class TestWeeklyRun:
         assert content == "**Weekly report -- week ending 10/3**"
         titles = [embed.title for embed in kwargs['embeds']]
         assert titles == ["Aetherians -- red GP (40)", "Pretherians -- links"]
-        assert kwargs['embeds'][-1].footer.text == "Backup: Database_2026_10_03.db"
+        assert kwargs['embeds'][-1].footer.text == f"{SNAPSHOT_NOTE} · Backup: Database_2026_10_03.db"
         assert kwargs['allowed_mentions'].everyone is False
+
+    def test_snapshot_problems_open_the_report(self, weekly):
+        weekly.snapshot["Pretherians"] = {'recorded': 10, 'zeros': 9, 'roster': 10}
+        weekly.sections["red:Aetherians"] = section("Aetherians -- red GP (40)")
+        run(weekly)
+        titles = [embed.title for embed in weekly.mod.sent[0][1]['embeds']]
+        assert titles == ["Pretherians -- snapshot check", "Aetherians -- red GP (40)"]
+
+    def test_estimated_weeks_are_explained(self, weekly):
+        for guild in logic.GUILD_NAMES:
+            weekly.snapshot[guild] = {'previous': "GP2026_09_19", 'missed': ["GP2026_09_26"]}
+        run(weekly)
+        [embed] = weekly.mod.sent[0][1]['embeds']
+        assert embed.title == "Missed weeks estimated"
+        assert "spread evenly over 9/26 and 10/3" in embed.description
+
+    def test_a_crash_in_the_check_is_an_error_not_silence(self, weekly, monkeypatch):
+        def broken(guild, run_key):
+            raise sqlite3.OperationalError("no such table")
+        monkeypatch.setattr(Functions, "snapshot_status", broken)
+        with pytest.raises(weekly.module.WeeklyReportIncomplete):
+            run(weekly)
+        [embed] = weekly.mod.sent[0][1]['embeds']
+        assert embed.title == "Snapshot check failed"
+        assert embed.footer.text == "Backup: Database_2026_10_03.db"
 
     def test_a_partial_role_sync_is_an_amber_embed(self, weekly, monkeypatch):
         async def partial(bot, df):
@@ -414,7 +466,7 @@ class TestWeeklyRun:
         run(weekly)
         [embed] = weekly.mod.sent[0][1]['embeds']
         assert embed.title == "Weekly backup failed"
-        assert embed.footer.text is None
+        assert embed.footer.text == SNAPSHOT_NOTE
 
     def test_without_embed_links_it_says_so_and_keeps_the_backup_name(self, weekly):
         weekly.mod._embed_links = False
@@ -576,6 +628,7 @@ class TestFailureAdvice:
 
     def test_the_scheduled_run_says_not_to_rerun_and_logs_once(self, weekly, monkeypatch, capsys):
         monkeypatch.setattr(Functions, "GP_roles", role_sync_crash)
+        weekly.taken.clear()
         with freeze_time("2026-10-03 02:10:00"):
             asyncio.run(weekly.module.gp_weekly_loop.coro())
         report, advice = [content for content, _ in weekly.mod.sent]
@@ -586,7 +639,8 @@ class TestFailureAdvice:
     def test_the_manual_run_is_told_the_same(self, weekly, monkeypatch):
         monkeypatch.setattr(Functions, "GP_roles", role_sync_crash)
         here = FakeChannel(channel_id=1)
-        asyncio.run(weekly.module.GP_weekly_man.callback(FakeContext(here)))
+        with freeze_time("2026-10-03 10:00:00"):
+            asyncio.run(weekly.module.GP_weekly_man.callback(FakeContext(here)))
         started, advice = [content for content, _ in here.sent]
         assert started.startswith("Weekly run started")
         assert "don't re-run !GP_weekly" in advice
@@ -599,6 +653,203 @@ class TestFailureAdvice:
         assert "export" not in weekly.calls and "GP_databases" not in weekly.calls
 
 
+def tick(weekly, when):
+    with freeze_time(when):
+        asyncio.run(weekly.module.gp_weekly_loop.coro())
+
+
+class TestScheduledRetries:
+    """From 2 AM Saturday the loop runs the job until the snapshot is taken:
+    every 10 minutes until 4 AM, every 30 until midnight."""
+
+    def test_a_failed_first_attempt_is_posted_with_retry_advice(self, weekly):
+        weekly.taken.clear()
+        weekly.export_error = RuntimeError("Firebase unavailable")
+        tick(weekly, "2026-10-03 02:00:00")
+        [(content, _)] = weekly.mod.sent
+        assert "Firebase unavailable" in content and "retry every 10 minutes" in content
+
+    def test_a_retry_runs_ten_minutes_later_not_five(self, weekly):
+        weekly.taken.clear()
+        weekly.export_error = RuntimeError("Firebase unavailable")
+        tick(weekly, "2026-10-03 02:00:00")
+        weekly.export_error = None
+        tick(weekly, "2026-10-03 02:05:00")
+        assert weekly.calls.count("export") == 1
+        tick(weekly, "2026-10-03 02:10:00")
+        assert "GP_databases" in weekly.calls
+        assert weekly.mod.sent[-1][0].startswith("**Weekly report -- week ending 10/3**")
+
+    def test_a_retry_failure_is_only_logged(self, weekly, capsys):
+        weekly.taken.clear()
+        weekly.export_error = RuntimeError("Firebase unavailable")
+        tick(weekly, "2026-10-03 02:00:00")
+        tick(weekly, "2026-10-03 02:10:00")
+        assert weekly.calls.count("export") == 2
+        assert len(weekly.mod.sent) == 1
+        assert capsys.readouterr().err.count("weekly GP job failed") == 2
+
+    def test_retries_sign_in_as_retries(self, weekly):
+        """So a rejected password pauses them, instead of each retry adding a
+        failed login to the guild account."""
+        weekly.taken.clear()
+        weekly.export_error = RuntimeError("Firebase unavailable")
+        tick(weekly, "2026-10-03 02:00:00")
+        tick(weekly, "2026-10-03 02:10:00")
+        assert weekly.export_retry == [False, True]
+
+    def test_a_first_failure_after_four_says_every_thirty_minutes(self, weekly):
+        weekly.taken.clear()
+        weekly.export_error = RuntimeError("Firebase unavailable")
+        tick(weekly, "2026-10-03 11:00:00")
+        [(content, _)] = weekly.mod.sent
+        assert "retry every 30 minutes until midnight" in content
+
+    def test_the_sections_read_the_snapshots_own_week(self, weekly):
+        """A run can cross midnight into a Saturday; the sections must not
+        switch to the new week's columns."""
+        with freeze_time("2026-10-10 00:05:00"):
+            asyncio.run(weekly.module.run_weekly_gp(run_key=WEEK))
+        assert {day.date().isoformat() for day in weekly.dataframe_days} == {"2026-10-03"}
+
+    def test_a_late_success_says_how_late(self, weekly):
+        """The bot was down at 2 AM and came back at 9."""
+        weekly.taken.clear()
+        tick(weekly, "2026-10-03 09:00:00")
+        [(content, _)] = weekly.mod.sent
+        assert f"{SNAPSHOT_NOTE} -- taken 7h late." in content
+
+    def test_nothing_runs_while_a_job_is_running(self, weekly, monkeypatch):
+        weekly.taken.clear()
+        monkeypatch.setattr(Functions, "weekly_job_depth", 1)
+        tick(weekly, "2026-10-03 02:00:00")
+        assert weekly.calls == [] and weekly.mod.sent == []
+
+
+class TestSnapshotReminder:
+    """After the Saturday retries, a missing snapshot is a daily reminder until
+    the next Saturday's run spreads the gap."""
+
+    def test_nothing_runs_on_sunday_and_the_reminder_fires_daily(self, weekly):
+        weekly.taken.clear()
+        tick(weekly, "2026-10-04 00:05:00")
+        tick(weekly, "2026-10-04 12:00:00")
+        assert weekly.calls == []
+        [(content, _)] = weekly.mod.sent
+        assert content.startswith("No GP snapshot was taken for the week ending 10/3.")
+        assert "The bot wasn't running on Saturday." in content
+        tick(weekly, "2026-10-05 00:05:00")
+        assert len(weekly.mod.sent) == 2
+
+    def test_it_carries_the_last_error(self, weekly):
+        weekly.taken.clear()
+        weekly.export_error = RuntimeError("Firebase unavailable")
+        tick(weekly, "2026-10-03 23:40:00")
+        tick(weekly, "2026-10-04 00:05:00")
+        assert "the last error: Firebase unavailable" in weekly.mod.sent[-1][0]
+
+    def test_it_says_when_the_login_was_rejected(self, weekly):
+        weekly.taken.clear()
+        weekly.module._poll_signin_paused_until["Aetherians"] = float('inf')
+        asyncio.run(Functions.mark_weekly_run_started(WEEK))
+        tick(weekly, "2026-10-04 00:05:00")
+        assert "The guild login was rejected" in weekly.mod.sent[-1][0]
+
+    def test_a_restart_does_not_repost_it(self, weekly, temp_functions_db, monkeypatch):
+        weekly.taken.clear()
+        tick(weekly, "2026-10-04 00:05:00")
+        restarted = sqlite3.connect(str(temp_functions_db))
+        monkeypatch.setattr(Functions, "conn", restarted)
+        monkeypatch.setattr(Functions, "c", restarted.cursor())
+        monkeypatch.setattr(weekly.module, "_weekly_last_error", {})
+        try:
+            tick(weekly, "2026-10-04 00:10:00")
+        finally:
+            restarted.close()
+        assert len(weekly.mod.sent) == 1
+
+
+class TestManualWeeklyRun:
+    def test_refused_midweek(self, weekly):
+        here = FakeChannel(channel_id=1)
+        with freeze_time("2026-10-07 12:00:00"):
+            asyncio.run(weekly.module.GP_weekly_man.callback(FakeContext(here)))
+        [(content, _)] = here.sent
+        assert content.startswith("!GP_weekly only runs on Saturdays")
+        assert "overwrite Saturday's snapshot" in content
+        assert weekly.calls == []
+
+    def test_a_refusal_is_not_a_weekly_job(self, weekly):
+        """Entering weekly_job() would discard an in-flight invite-poll roster
+        read and turn !sync_counters away while the refusal is sent."""
+        depths = []
+
+        class Watching(FakeChannel):
+            async def send(self, content=None, **kwargs):
+                depths.append(Functions.weekly_job_depth)
+                await super().send(content, **kwargs)
+
+        generation = Functions.roster_generation
+        with freeze_time("2026-10-07 12:00:00"):
+            asyncio.run(weekly.module.GP_weekly_man.callback(FakeContext(Watching(channel_id=1))))
+        assert depths == [0]
+        assert Functions.roster_generation == generation
+
+    def test_force_runs_midweek_and_the_note_says_how_late(self, weekly):
+        here = FakeChannel(channel_id=1)
+        with freeze_time("2026-10-07 12:00:00"):
+            asyncio.run(weekly.module.GP_weekly_man.callback(FakeContext(here), "force"))
+        assert "GP_databases" in weekly.calls
+        assert "taken 4 days late" in weekly.mod.sent[0][0]
+
+    def test_saturday_needs_no_force(self, weekly):
+        here = FakeChannel(channel_id=1)
+        with freeze_time("2026-10-03 15:00:00"):
+            asyncio.run(weekly.module.GP_weekly_man.callback(FakeContext(here)))
+        assert "GP_databases" in weekly.calls
+
+    def test_an_unknown_option_gets_usage(self, weekly):
+        here = FakeChannel(channel_id=1)
+        asyncio.run(weekly.module.GP_weekly_man.callback(FakeContext(here), "now"))
+        assert here.sent[0][0] == "Usage: !GP_weekly [force]"
+        assert weekly.calls == []
+
+    def test_it_holds_the_job_counter_before_its_first_await(self, weekly):
+        """Otherwise a retry tick could start a second cycle while the
+        "started" reply is in flight."""
+        depths = []
+
+        class Watching(FakeChannel):
+            async def send(self, content=None, **kwargs):
+                depths.append(Functions.weekly_job_depth)
+                await super().send(content, **kwargs)
+
+        with freeze_time("2026-10-03 15:00:00"):
+            asyncio.run(weekly.module.GP_weekly_man.callback(FakeContext(Watching(channel_id=1))))
+        assert depths[0] >= 1
+
+    def test_a_failure_says_why_and_whether_the_week_was_saved(self, weekly):
+        weekly.taken.clear()
+        weekly.export_error = RuntimeError("Firebase unavailable")
+        here = FakeChannel(channel_id=1)
+        with freeze_time("2026-10-03 15:00:00"):
+            asyncio.run(weekly.module.GP_weekly_man.callback(FakeContext(here)))
+        assert here.sent[-1][0] == (
+            "Weekly run failed: Firebase unavailable. Nothing was saved for this week."
+        )
+
+
+class TestMembersGame:
+    def test_refused_while_a_weekly_run_is_going(self, weekly, monkeypatch):
+        """It writes {guild}_game, which the snapshot check reads after the
+        export lock is released."""
+        monkeypatch.setattr(Functions, "weekly_job_depth", 1)
+        here = FakeChannel(channel_id=1)
+        asyncio.run(weekly.module.members_guild.callback(FakeContext(here)))
+        assert here.sent[0][0].startswith("A weekly run is in progress")
+        assert weekly.calls == []
+
+
 class TestInterruptedRun:
     def test_a_run_that_never_ended_is_reported_once(self, weekly):
         asyncio.run(Functions.mark_weekly_run_started(WEEK))
@@ -606,6 +857,42 @@ class TestInterruptedRun:
         asyncio.run(weekly.module.report_interrupted_weekly_run())
         [(content, _)] = weekly.mod.sent
         assert "week ending 10/3" in content and "never finished" in content
+
+    def test_a_retry_that_died_again_is_logged_not_posted(self, weekly, capsys):
+        """A crash on every attempt would otherwise post a notice per restart,
+        up to one every ten minutes all Saturday."""
+        weekly.taken.clear()
+        asyncio.run(Functions.mark_weekly_run_started(WEEK))
+        Functions.mark_weekly_runs_ended()
+        asyncio.run(Functions.mark_weekly_run_started(WEEK))
+        with freeze_time("2026-10-03 03:00:00"):
+            asyncio.run(weekly.module.report_interrupted_weekly_run())
+        assert weekly.mod.sent == []
+        assert "interrupted again (attempt 2)" in capsys.readouterr().err
+        assert Functions.interrupted_weekly_run() is None
+
+    def test_no_promise_of_retries_after_a_rejected_login(self, weekly):
+        weekly.taken.clear()
+        weekly.module._poll_signin_paused_until["Aetherians"] = float('inf')
+        asyncio.run(Functions.mark_weekly_run_started(WEEK))
+        with freeze_time("2026-10-03 03:00:00"):
+            asyncio.run(weekly.module.report_interrupted_weekly_run())
+        [(content, _)] = weekly.mod.sent
+        assert "retrying" not in content
+
+    @pytest.mark.parametrize("taken,now,expected", [
+        (True, "2026-10-03 03:00:00", "The snapshot was saved"),
+        (False, "2026-10-03 03:00:00", "I'll keep retrying until midnight"),
+        (False, "2026-10-05 09:00:00", "Next Saturday's run will spread"),
+    ])
+    def test_it_says_what_happens_next(self, weekly, taken, now, expected):
+        if not taken:
+            weekly.taken.clear()
+        asyncio.run(Functions.mark_weekly_run_started(WEEK))
+        with freeze_time(now):
+            asyncio.run(weekly.module.report_interrupted_weekly_run())
+        [(content, _)] = weekly.mod.sent
+        assert expected in content
 
     def test_a_run_still_in_progress_is_not_reported(self, weekly, monkeypatch):
         """on_ready fires on reconnects, mid-run included."""
@@ -618,7 +905,7 @@ class TestInterruptedRun:
         Functions.c.execute("CREATE TABLE weekly_runs (run_key TEXT PRIMARY KEY, started_at TEXT)")
         Functions.c.execute("INSERT INTO weekly_runs VALUES ('GP2026_09_26', '2026-09-26T02:00:00')")
         assert Functions.interrupted_weekly_run() is None
-        assert asyncio.run(Functions.weekly_run_already_started('GP2026_09_26'))
+        assert Functions.weekly_run_times('GP2026_09_26')[0] is not None
 
 
 class TestManualReports:
@@ -680,7 +967,7 @@ def test_a_rerun_rereads_everyones_gp_at_that_moment(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     assert (Path.cwd() / "DatabaseLedBot.db").resolve().parent == tmp_path.resolve()
 
-    columns = asyncio.run(Functions.get_date())
+    columns = Functions.get_date()
     this_week, last_week = columns["column_name1"], columns["column_name2"]
     db = sqlite3.connect("DatabaseLedBot.db")
     for guild in logic.GUILD_NAMES:

@@ -1,11 +1,10 @@
 import discord
 from discord.ext import commands
-from discord import app_commands
 import random
 import sqlite3
-from datetime import datetime, timedelta
 import json
 
+import Functions
 import logic
 
 WINNERS_FILE = "winners.json"
@@ -25,34 +24,33 @@ class Giveaway(commands.Cog):
                         guild_name: str = None, 
                         gp_required: int = None):
         
-        conn = sqlite3.connect('DatabaseLedBot.db')
-        conn.execute("PRAGMA journal_mode=WAL")
-        c = conn.cursor()
-        
         try:
-            
             with open(WINNERS_FILE, "r") as f:
                 winners = json.load(f)
             print(f"Loaded winners: {winners}")
         except FileNotFoundError:
             winners = []
                 
+        conn = sqlite3.connect('DatabaseLedBot.db')
+        conn.execute("PRAGMA journal_mode=WAL")
+        c = conn.cursor()
         try:
             guild_name, gp_required = logic.resolve_giveaway_args(guild_name, gp_required)
 
-
-            today = datetime.now()
-            last_saturday = today - timedelta(days=(today.weekday() + 2) % 7)
-            gp_column = f"GP{last_saturday.year}_{last_saturday.month:02}_{last_saturday.day:02}"
-            print("test6")
+            # The latest week that was taken, not last Saturday by the
+            # calendar: that column doesn't exist before the 2 AM run or
+            # after a missed week.
+            _, gp_column = await Functions.latest_snapshot_day()
             message_id = int(message_id)
             message = await channel.fetch_message(message_id)
+            if not message.reactions:
+                await ctx.send("That message has no reactions.")
+                return
             reaction = message.reactions[0]
             users = [user async for user in reaction.users() if not user.bot]
 
             # If no guild specified, treat it as if both guilds are selected
             guild_names = [guild_name] if guild_name else list(logic.GUILD_NAMES)
-            print("test7")
             final_participants = []
             for guild in guild_names:
                 filtered_users = []
@@ -60,7 +58,6 @@ class Giveaway(commands.Cog):
                     member = ctx.guild.get_member(user.id)
                     if member and any(role.name == guild for role in member.roles):
                         filtered_users.append(member)
-                print("test8")
                 participant_ids = [member.id for member in filtered_users]
                 
                 members_table = logic.table_name(guild, 'members')
@@ -68,12 +65,10 @@ class Giveaway(commands.Cog):
                 c.execute(query1, participant_ids)
                 members_results = c.fetchall()
                 g_ids = [row[4] for row in members_results]
-                print("test9")
                 gp_table = logic.table_name(guild, 'GP_gained')
                 query2 = f"SELECT * FROM {gp_table} WHERE G_ID IN ({','.join(['?' for _ in g_ids])}) AND {gp_column} IS NOT NULL AND CAST({gp_column} AS INTEGER) >= ?"
                 c.execute(query2, g_ids + [gp_required])
                 gp_results = c.fetchall()
-                print("test10")
                 for gp_row in gp_results:
                     g_id = gp_row[1]
                     member = next((m for m in members_results if m[4] == g_id), None)
@@ -83,6 +78,9 @@ class Giveaway(commands.Cog):
                         if participant:
                             final_participants.append(participant)
                             
+            # Someone with two qualifying characters, or one in each guild, was
+            # added once per character and had that many chances.
+            final_participants = logic.unique_by_id(final_participants)
             print(f"Final participants: {[p.name for p in final_participants]}")
             eligible_participants = logic.filter_eligible_participants(final_participants, winners)
             print(f"Eligible participants: {eligible_participants}")
@@ -99,6 +97,8 @@ class Giveaway(commands.Cog):
             await ctx.send(str(e))
         except Exception as e:
             await ctx.send(f"An error occurred: {e}")
+        finally:
+            conn.close()
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(Giveaway(bot))

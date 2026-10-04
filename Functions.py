@@ -1,22 +1,18 @@
 from datetime import datetime, timedelta
-import pandas as pd
 import sqlite3
 import inspect
 import discord
 import os
-import re
 from dotenv import load_dotenv
-import aiohttp
+import io
 import json
-import time
-from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from google.oauth2.service_account import Credentials
 import asyncio
 from contextlib import contextmanager
 
 import logic
-from scripts.backup_db import run_backup
+from scripts.backup_db import run_manual_backup
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 CREDS = Credentials.from_service_account_file(
@@ -25,21 +21,21 @@ CREDS = Credentials.from_service_account_file(
     )
 
 load_dotenv()
+# Relative on purpose: the bot runs from the repo root (systemd sets
+# WorkingDirectory). GP_databases opens its own connection on the same path.
+DB_PATH = 'DatabaseLedBot.db'
 # WAL lets the weekly job and a moderator command touch the database at the
 # same moment without hitting "database is locked".
-conn = sqlite3.connect('DatabaseLedBot.db')
+conn = sqlite3.connect(DB_PATH)
 conn.execute("PRAGMA journal_mode=WAL")
 c = conn.cursor()
 
 GP_prefix = 'GP'
-separator = ' | '
 # GP rank thresholds live in logic.RANK_THRESHOLDS (single source of truth).
 
 
 WB_sheet_name = os.environ.get('WB_SHEET_NAME')
 WB_spreadsheet_id = os.environ.get('WB_SPREADSHEET_ID')
-GOOGLE_API_KEY = os.getenv('GOOGLESHEETS_API')
-service = build('sheets', 'v4', developerKey=GOOGLE_API_KEY, cache_discovery=False)
 
 def _sync_fetch_cell(spreadsheet_id: str, sheet_name: str, cell: str):
     """Blocking Google API call (runs in thread)."""
@@ -57,51 +53,35 @@ def _sync_fetch_cell(spreadsheet_id: str, sheet_name: str, cell: str):
     return logic.extract_cell_value(values)
 
 async def get_cell_value(cell: str) -> str:
-    try:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            None,
-            _sync_fetch_cell,
-            WB_spreadsheet_id,
-            WB_sheet_name,
-            cell
-        )
-    except Exception as error:
-        print(f"Error fetching cell value: {error}")
-        return "Failed to fetch boss strategy from spreadsheet"
+    # Errors propagate: caught here and returned as text, a failure was posted
+    # under the "Boss Strategy" heading as though it were the strategy.
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None,
+        _sync_fetch_cell,
+        WB_spreadsheet_id,
+        WB_sheet_name,
+        cell
+    )
 
 #get date
-async def get_date(today=None):
-    # dates and column names:
+def get_date(today=None):
+    """Column names for the week containing `today`: its Saturday's snapshot
+    and the three before it."""
     today = today or datetime.today()
-    if today.weekday() == 5:
-        day_temp = today
-    else: 
-        days_since_saturday = (today.weekday() - 5) % 7
-        day_temp = today - timedelta(days=days_since_saturday)
-
-    day = day_temp.strftime('%Y_%m_%d')
-    one_week_ago = (day_temp - timedelta(days=7)).strftime('%Y_%m_%d')
-    two_week_ago = (day_temp - timedelta(days=14)).strftime('%Y_%m_%d')
-    three_week_ago = (day_temp - timedelta(days=21)).strftime('%Y_%m_%d')
-    
-    column_name1 = f"{GP_prefix}{day}"
-    column_name2 = f"{GP_prefix}{one_week_ago}"
-    column_name3 = f"{GP_prefix}{two_week_ago}"
-    column_name4 = f"{GP_prefix}{three_week_ago}"
-    column_names = ['Name', 'G_ID', column_name4, column_name3, column_name2, column_name1]
-    column_names_int = [column_name4, column_name3, column_name2, column_name1]  
-    
-    column_names_dict = {
+    saturday = today - timedelta(days=(today.weekday() - 5) % 7)
+    column_name4, column_name3, column_name2, column_name1 = (
+        logic.snapshot_column(saturday - timedelta(days=7 * weeks)) for weeks in (3, 2, 1, 0)
+    )
+    column_names_int = [column_name4, column_name3, column_name2, column_name1]
+    return {
         "column_name1": column_name1,
         "column_name2": column_name2,
         "column_name3": column_name3,
         "column_name4": column_name4,
-        "column_names": column_names,
-        "column_names_int": column_names_int
+        "column_names": ['Name', 'G_ID', *column_names_int],
+        "column_names_int": column_names_int,
     }
-    
-    return column_names_dict
 
 WEEKLY_RUNS_TABLE = 'weekly_runs'
 
@@ -109,7 +89,7 @@ WEEKLY_RUNS_TABLE = 'weekly_runs'
 def _ensure_weekly_runs_table():
     c.execute(
         f"CREATE TABLE IF NOT EXISTS {WEEKLY_RUNS_TABLE} "
-        "(run_key TEXT PRIMARY KEY, started_at TEXT, ended_at TEXT)"
+        "(run_key TEXT PRIMARY KEY, started_at TEXT, ended_at TEXT, reminded_at TEXT, attempts INTEGER)"
     )
     columns = [row[1] for row in c.execute(f"PRAGMA table_info({WEEKLY_RUNS_TABLE})")]
     if 'ended_at' not in columns:
@@ -117,6 +97,10 @@ def _ensure_weekly_runs_table():
         # backfill each one would be reported as interrupted.
         c.execute(f"ALTER TABLE {WEEKLY_RUNS_TABLE} ADD COLUMN ended_at TEXT")
         c.execute(f"UPDATE {WEEKLY_RUNS_TABLE} SET ended_at = started_at")
+    if 'reminded_at' not in columns:
+        c.execute(f"ALTER TABLE {WEEKLY_RUNS_TABLE} ADD COLUMN reminded_at TEXT")
+    if 'attempts' not in columns:
+        c.execute(f"ALTER TABLE {WEEKLY_RUNS_TABLE} ADD COLUMN attempts INTEGER")
     conn.commit()
 
 
@@ -130,46 +114,59 @@ def mark_weekly_runs_ended():
 
 
 def interrupted_weekly_run():
-    """(run_key, started_at) of a weekly run that started and never ended --
-    the process died mid-cycle, taking its unposted report with it -- or None.
-    Only meaningful when no weekly job is running in this process."""
+    """(run_key, started_at, attempts) of a weekly run that started and never
+    ended -- the process died mid-cycle, taking its unposted report with it --
+    or None. Only meaningful when no weekly job is running in this process."""
     _ensure_weekly_runs_table()
     return c.execute(
-        f"SELECT run_key, started_at FROM {WEEKLY_RUNS_TABLE} "
-        "WHERE ended_at IS NULL ORDER BY started_at DESC LIMIT 1"
+        f"SELECT run_key, started_at, COALESCE(attempts, 1) FROM {WEEKLY_RUNS_TABLE} "
+        "WHERE ended_at IS NULL AND started_at IS NOT NULL ORDER BY started_at DESC LIMIT 1"
     ).fetchone()
 
 
-async def weekly_run_already_started(run_key: str) -> bool:
-    """Whether the weekly cycle has already been started for this GP week.
+async def mark_weekly_run_started(run_key: str, started_at: datetime | None = None) -> None:
+    """Record that an attempt at this GP week's cycle has started.
 
-    Kept in the database rather than in memory because the bot restarts: a
-    module global is lost on restart, and systemd runs the bot with
-    Restart=on-failure, so a crash during the 2 AM job would restart inside the
-    same hour and run the whole cycle again -- the duplicate weekly report all
-    over again, and potentially in a loop.
-    """
-    _ensure_weekly_runs_table()
-    row = c.execute(
-        f"SELECT 1 FROM {WEEKLY_RUNS_TABLE} WHERE run_key = ?", (run_key,)
-    ).fetchone()
-    return row is not None
-
-
-async def mark_weekly_run_started(run_key: str) -> None:
-    """Record that this GP week's cycle has been started.
-
-    Deliberately recorded at the start, not on success: it caps the automatic
-    run at one attempt per week, so a repeatable failure cannot turn into a
-    restart loop. A failed run is reported to the mod channel, and a moderator
-    re-runs it with !GP_weekly.
+    Recorded at the start, not on success: the loop spaces its Saturday
+    retries from this time, and because it is in the database a crash-restart
+    can't retry any sooner. An upsert rather than INSERT OR REPLACE, which
+    would wipe reminded_at along with the row. attempts lets a crash on every
+    retry be reported once rather than on every restart.
     """
     _ensure_weekly_runs_table()
     c.execute(
-        f"INSERT OR REPLACE INTO {WEEKLY_RUNS_TABLE} (run_key, started_at) VALUES (?, ?)",
-        (run_key, datetime.now().isoformat(timespec='seconds')),
+        f"INSERT INTO {WEEKLY_RUNS_TABLE} (run_key, started_at, attempts) VALUES (?, ?, 1) "
+        "ON CONFLICT(run_key) DO UPDATE SET started_at = excluded.started_at, ended_at = NULL, "
+        "attempts = COALESCE(attempts, 0) + 1",
+        (run_key, (started_at or datetime.now()).isoformat(timespec='seconds')),
     )
     conn.commit()
+
+
+def mark_snapshot_reminded(run_key: str, now: datetime) -> None:
+    """Record that the mod channel was reminded this week's snapshot is missing.
+
+    When nothing was attempted -- the bot was down all Saturday -- this creates
+    the row, ended and with no started_at, so it never reads as an interrupted
+    run or as an attempt.
+    """
+    _ensure_weekly_runs_table()
+    stamp = now.isoformat(timespec='seconds')
+    c.execute(
+        f"INSERT INTO {WEEKLY_RUNS_TABLE} (run_key, ended_at, reminded_at) VALUES (?, ?, ?) "
+        "ON CONFLICT(run_key) DO UPDATE SET reminded_at = excluded.reminded_at",
+        (run_key, stamp, stamp),
+    )
+    conn.commit()
+
+
+def weekly_run_times(run_key: str) -> tuple[datetime | None, datetime | None]:
+    """(last attempt's start, last reminder) for a GP week; None where never."""
+    _ensure_weekly_runs_table()
+    row = c.execute(
+        f"SELECT started_at, reminded_at FROM {WEEKLY_RUNS_TABLE} WHERE run_key = ?", (run_key,)
+    ).fetchone() or (None, None)
+    return tuple(datetime.fromisoformat(value) if value else None for value in row)
 
 
 # How many weekly jobs are running (a counter, not a flag: a moderator's
@@ -187,9 +184,10 @@ def weekly_job():
     """Mark the weekly cycle as running while the body executes.
 
     The invite poll refreshes {guild}_game mid-week. The weekly job exports
-    {guild}_game and then GP_databases reads it, with an await in between
-    (members_guild's ctx.send), so a poll write landing there would have this
-    week's GP computed against a different roster from the one just exported.
+    each guild's roster with an await per guild, then GP_databases reads them
+    and the snapshot check reads them again, so a poll write landing in
+    between would have this week's GP computed against a different roster
+    from the one just exported.
     """
     global weekly_job_depth, roster_generation
     weekly_job_depth += 1
@@ -200,11 +198,39 @@ def weekly_job():
         weekly_job_depth -= 1
 
 
+SNAPSHOT_LOOKBACK_WEEKS = 52
+
+
+async def latest_snapshot_day(today=None):
+    """(a day in the latest week with a snapshot, that week's column).
+
+    Walks back from this week to the newest one that was taken: this week is
+    missing on Saturday before the 2 AM run, and so is last week when a whole
+    Saturday failed and the next one hasn't filled it in yet. Falls back to
+    this week if nothing within a year was taken.
+    """
+    today = today or datetime.today()
+    day = today
+    for _ in range(SNAPSHOT_LOOKBACK_WEEKS):
+        run_key = (get_date(day))["column_name1"]
+        if snapshot_taken(run_key):
+            return day, run_key
+        day -= timedelta(days=7)
+    return today, (get_date(today))["column_name1"]
+
+
 #get the dataframe
 async def GP_dataframe(IOguild, today=None):
+    """The guild's last four weeks of gains, up to the week containing `today`.
+
+    Without `today`, the latest week that was taken -- so a missed Saturday
+    doesn't make it ask for a column that was never written.
+    """
     table_name_gained = logic.table_name(IOguild, 'GP_gained')
-    
-    column_names_dict = await get_date(today)
+    if today is None:
+        today, _ = await latest_snapshot_day()
+
+    column_names_dict = get_date(today)
     column_names = column_names_dict["column_names"]
     column_names_int = column_names_dict["column_names_int"]
     
@@ -238,6 +264,19 @@ async def GP_roles(bot, monthly_gp_df):
         # fail with an unhelpful AttributeError on None.
         print("GP_roles: Discord server not in cache, skipping the role sync")
         return "the Discord server was not in cache"
+    # One member Discord refuses (a role above the bot's, say) used to abort
+    # the sync for everyone after them, Monthly Top included.
+    failures = []
+
+    async def change(action, member, role):
+        try:
+            await action(role)
+            return True
+        except discord.HTTPException as e:
+            print(f"GP_roles: could not update {member}: {e}")
+            failures.append(f"{member.display_name}: {e}")
+            return False
+
     for row in result:
         D_ID = row[0]
         GP = row[1]
@@ -255,7 +294,8 @@ async def GP_roles(bot, monthly_gp_df):
             print(f"Role '{target_role_name}' does not exist in the Discord server, skipping")
             continue
         if role2give not in member.roles:
-            await member.add_roles(role2give)
+            if not await change(member.add_roles, member, role2give):
+                continue
             # Only remove the immediately-adjacent lower rank (promotion-only sync,
             # matching the original behavior -- this doesn't demote members whose
             # GP has dropped, and doesn't strip every other rank role they hold).
@@ -266,7 +306,7 @@ async def GP_roles(bot, monthly_gp_df):
                 if role2remove is None:
                     print(f"Role '{lower_rank_name}' does not exist, leaving it in place")
                 else:
-                    await member.remove_roles(role2remove)
+                    await change(member.remove_roles, member, role2remove)
 
     # Rebind rather than dropna(inplace=True): this dataframe belongs to the
     # caller, which passes the same object on to red_gp afterwards. Mutating it
@@ -281,7 +321,9 @@ async def GP_roles(bot, monthly_gp_df):
     booster_duck = discord.utils.get(guild.roles, name = 'Booster (For DUCK)')
     if clammy is None:
         print("Role 'Monthly Top' does not exist in the Discord server, skipping the Monthly Top sync")
-        return "rank roles were synced, but the 'Monthly Top' role does not exist"
+        return logic.format_role_sync_status(
+            "rank roles were synced, but the 'Monthly Top' role does not exist", failures
+        )
     # The duck pairing only makes sense when both roles resolve; without this,
     # a missing 'Aetherian Duck' would reach add_roles(None) and crash.
     sync_ducks = aeth_duck is not None and booster_duck is not None
@@ -296,9 +338,9 @@ async def GP_roles(bot, monthly_gp_df):
     members_with_clammy = [member for member in guild.members if clammy in member.roles]
     for member in members_with_clammy:
         if member.id not in d_ids:
-            await member.remove_roles(clammy)
+            await change(member.remove_roles, member, clammy)
             if sync_ducks and booster_duck in member.roles:
-                await member.remove_roles(aeth_duck)
+                await change(member.remove_roles, member, aeth_duck)
 
     #give clammy
     for d_id in d_ids:
@@ -308,13 +350,15 @@ async def GP_roles(bot, monthly_gp_df):
             print("member is None, error. Skipping")
             continue
         if clammy not in member.roles:
-            await member.add_roles(clammy)
+            await change(member.add_roles, member, clammy)
             if sync_ducks and booster_duck in member.roles:
-                await member.add_roles(aeth_duck)
+                await change(member.add_roles, member, aeth_duck)
 
-    if not sync_ducks:
-        return "roles were synced, but the duck pairing was skipped (a duck role is missing)"
-    return None
+    return logic.format_role_sync_status(
+        None if sync_ducks
+        else "roles were synced, but the duck pairing was skipped (a duck role is missing)",
+        failures,
+    )
                 
 #red GP
 def red_gp_report(monthly_gp_df, IOguild):
@@ -341,18 +385,48 @@ def red_gp_report(monthly_gp_df, IOguild):
         print("line: " + str(inspect.currentframe().f_lineno) + "\n error: " + str(e))
         return [logic.failure_embed(f"{IOguild} -- red GP failed", e)]
 
-GP_COLUMN_RE = re.compile(r'^GP(\d{4})_(\d{2})_(\d{2})$')
+def _table_columns(cursor, table):
+    return [row[1] for row in cursor.execute(f"PRAGMA table_info({table})")]
 
 
 def _gp_snapshot_columns(table_name_gained):
     """Every weekly snapshot column of the table, oldest first."""
-    names = [row[1] for row in c.execute(f"PRAGMA table_info({table_name_gained})")]
-    dated = [
-        (match.groups(), name)
-        for match, name in ((GP_COLUMN_RE.match(n), n) for n in names)
-        if match
-    ]
-    return [name for _, name in sorted(dated)]
+    return logic.sorted_snapshot_columns(_table_columns(c, table_name_gained))
+
+
+def _measured_columns(cursor, IOguild):
+    """The snapshot weeks whose {guild}_GP column holds values.
+
+    By data, not by the column existing: the old GP_databases could fail after
+    its first ALTER TABLE had autocommitted, leaving an all-NULL column that
+    was never a measurement. _GP holds only measured totals -- a missed week
+    spread by a catch-up is written to _GP_gained alone -- so this is also the
+    record of which weeks were estimated. One scan: COUNT() of every column.
+    """
+    table = logic.table_name(IOguild, 'GP')
+    columns = logic.sorted_snapshot_columns(_table_columns(cursor, table))
+    if not columns:
+        return set()
+    counts = cursor.execute(
+        f"SELECT {', '.join(f'COUNT({column})' for column in columns)} FROM {table}"
+    ).fetchone()
+    return {column for column, count in zip(columns, counts) if count}
+
+
+def _is_measured(cursor, IOguild, column):
+    """_measured_columns for a single week, without scanning every column."""
+    table = logic.table_name(IOguild, 'GP')
+    if column not in _table_columns(cursor, table):
+        return False
+    return cursor.execute(f"SELECT 1 FROM {table} WHERE {column} IS NOT NULL LIMIT 1").fetchone() is not None
+
+
+def _previous_measured(measured, run_key):
+    """The latest measured week before run_key, or None -- what this week's
+    gain is measured against. A half-added all-NULL column is skipped."""
+    target = logic.snapshot_date(run_key)
+    earlier = [column for column in measured if logic.snapshot_date(column) < target]
+    return max(earlier, key=logic.snapshot_date, default=None)
 
 
 def _load_gp_series(IOguild):
@@ -367,10 +441,14 @@ def _load_gp_series(IOguild):
     The whole history is read, not just the audited window: logic.audit_member
     has to know which week is a member's first (that one is their lifetime GP,
     not a week's worth) and how many weeks they have in total.
+
+    Returns (members, the series positions whose gain was spread over a
+    missed snapshot).
     """
     table_name_gained = logic.table_name(IOguild, 'GP_gained')
     table_name_game = logic.table_name(IOguild, 'game')
     columns = _gp_snapshot_columns(table_name_gained)
+    estimated_columns = logic.estimated_gain_columns(columns, _measured_columns(c, IOguild))
 
     rows = c.execute(
         f"SELECT r.G_NAME, g.Name, {', '.join('g.' + column for column in columns)} "
@@ -382,14 +460,16 @@ def _load_gp_series(IOguild):
     for current_name, gp_name, *gains in rows:
         label = current_name if current_name == gp_name else f"{current_name} (was {gp_name})"
         members[label] = [logic.parse_gp_value(value) for value in gains]
-    return members
+    estimated = {index for index, column in enumerate(columns) if column in estimated_columns}
+    return members, estimated
 
 
 def gp_audit_report(IOguild):
     """Members whose weekly GP gains are worth a closer look, as embeds; []
     when nobody is flagged. The mirror of red_gp_report."""
     try:
-        sustained, spiked = logic.filter_gp_audit(_load_gp_series(IOguild))
+        members, estimated = _load_gp_series(IOguild)
+        sustained, spiked = logic.filter_gp_audit(members, estimated=estimated)
         return logic.section_embeds(IOguild, "GP audit", logic.format_gp_audit(sustained, spiked))
     except Exception as e:
         print("line: " + str(inspect.currentframe().f_lineno) + "\n error: " + str(e))
@@ -397,11 +477,49 @@ def gp_audit_report(IOguild):
 
 
 def snapshot_taken(column_name):
-    """Whether GP_databases has written this week's column for every guild."""
+    """Whether this week was measured for every guild: its _GP column holds
+    values and _GP_gained has the column. GP_databases is one transaction, so
+    False means nothing was written for the week."""
     return all(
-        column_name in _gp_snapshot_columns(logic.table_name(guild_name, 'GP_gained'))
+        _is_measured(c, guild_name, column_name)
+        and column_name in _gp_snapshot_columns(logic.table_name(guild_name, 'GP_gained'))
         for guild_name in logic.GUILD_NAMES
     )
+
+
+def snapshot_status(IOguild, run_key, counts=True):
+    """What one guild's snapshot for run_key holds, for the post-run check.
+
+    Counts distinct game ids: Pretherians has a G_ID duplicated in _GP_gained.
+    counts=False skips the roster and gain counts for a caller that only wants
+    which weeks were estimated.
+    """
+    table_gained = logic.table_name(IOguild, 'GP_gained')
+    table_game = logic.table_name(IOguild, 'game')
+    measured = _measured_columns(c, IOguild)
+    previous = _previous_measured(measured, run_key)
+    status = {
+        'guild': IOguild,
+        'column': run_key,
+        'previous': previous,
+        'missed': logic.missed_snapshot_columns(previous, run_key),
+        'present': run_key in measured and run_key in _gp_snapshot_columns(table_gained),
+        'roster': 0,
+        'recorded': 0,
+        'zeros': 0,
+        'negatives': 0,
+    }
+    if not counts:
+        return status
+    status['roster'] = c.execute(f"SELECT COUNT(DISTINCT G_ID) FROM {table_game}").fetchone()[0]
+    if status['present']:
+        status['recorded'], status['zeros'], status['negatives'] = c.execute(
+            f"SELECT COUNT(DISTINCT CASE WHEN g.{run_key} IS NOT NULL THEN r.G_ID END), "
+            f"COUNT(DISTINCT CASE WHEN CAST(g.{run_key} AS INTEGER) = 0 THEN r.G_ID END), "
+            f"COUNT(DISTINCT CASE WHEN CAST(g.{run_key} AS INTEGER) < 0 THEN r.G_ID END) "
+            f"FROM {table_game} AS r LEFT JOIN {table_gained} AS g ON g.G_ID = r.G_ID"
+        ).fetchone()
+    return status
 
 
 def _load_link_snapshot(IOguild):
@@ -661,7 +779,9 @@ async def whois(channel, term, discord_guild=None):
         await channel.send(f"Nothing matches '{term}' in either guild.")
         return
     for message in messages:
-        await channel.send(message)
+        # Eight characters with several links each can pass 2000 characters.
+        for part in logic.split_message(message):
+            await channel.send(part)
 
 
 def _resolve_role_holders(discord_guild, IOguild, d_ids):
@@ -692,10 +812,10 @@ def _relink_write(IOguild, g_id, current_name, target):
     """Repoint one character's link rows. Synchronous, and must stay that way.
 
     Functions.conn is a single connection shared by every coroutine, and
-    write_game_roster, GP_databases and mark_weekly_run_started all commit on it. An
-    await anywhere between the SELECT and the commit would let one of them
-    commit this function's half-finished delete, so the whole transaction runs
-    without yielding and the message is built by the caller afterwards.
+    write_game_roster, the invite store and mark_weekly_run_started all commit
+    on it. An await anywhere between the SELECT and the commit would let one of
+    them commit this function's half-finished delete, so the whole transaction
+    runs without yielding and the message is built by the caller afterwards.
 
     The delete names the rowids read a few lines above rather than repeating
     `WHERE G_ID = ?`. The predicate would be re-evaluated at delete time, so a
@@ -820,7 +940,7 @@ async def relink(channel, IOguild, g_id, target):
         return
 
     try:
-        backup_name = run_backup().name
+        backup_name = run_manual_backup().name
     except Exception as e:
         print("line: " + str(inspect.currentframe().f_lineno) + "\n error: " + str(e))
         await channel.send(f"Refusing to relink: the safety backup failed ({e}).")
@@ -1087,40 +1207,37 @@ def link_for_invite(IOguild, g_id, current_name, target):
 
 async def promotions(bot, channel):
     try:
-        with open('promo.txt', 'w') as file:
-            file.write(f"Discord name    | GP\n")
-        column_names_dict = await get_date()
-        column_name1 = column_names_dict["column_name1"]
-        role = discord.utils.get(channel.guild.roles, name="Promotions")
         guild = bot.get_guild(809954021028134943)
         if guild is None:
             await channel.send("Discord server not in cache, cannot check promotions right now.")
             return
+        role = discord.utils.get(guild.roles, name="Promotions")
+        if role is None:
+            await channel.send("There is no 'Promotions' role, so nobody can be listed.")
+            return
+        # The latest week that was taken: this week's column doesn't exist
+        # before the 2 AM run or after a missed Saturday.
+        _, column_name1 = await latest_snapshot_day()
         promo_members = logic.table_name(logic.PROMOTION_GUILD, 'members')
         promo_gained = logic.table_name(logic.PROMOTION_GUILD, 'GP_gained')
         c.execute(f'''SELECT PM.D_ID, PM.G_ID, PGG.{column_name1}
         FROM {promo_members} AS PM
         JOIN {promo_gained} AS PGG ON PM.G_ID = PGG.G_ID
-        WHERE PGG.{column_name1} >= {logic.PROMOTION_GP_REQUIREMENT}''')
-        result = c.fetchall()
-        found_any = False
-        for item in result:
-            member = guild.get_member(item[0])
-            GP = item[2]
+        WHERE CAST(PGG.{column_name1} AS INTEGER) >= {logic.PROMOTION_GP_REQUIREMENT}''')
+        lines = []
+        for d_id, _, GP in c.fetchall():
+            member = guild.get_member(d_id)
             if member is None:
-                print(f"Member with ID {item[0]} not found in guild.")
+                print(f"Member with ID {d_id} not found in guild.")
                 continue
             if role in member.roles:
-                print(member)
-                found_any = True
-                with open('promo.txt', 'a') as file:
-                    file.write(f"{member.name.ljust(15)} | {GP}\n")
-        if not found_any:
-            print('No members meet the requirements')
+                lines.append(f"{member.name.ljust(15)} | {GP}")
+        if not lines:
             await channel.send('No members meet the requirements')
-        file = discord.File('promo.txt')
-        await channel.send(file=file)
-        os.remove('promo.txt')
+            return
+        # Built in memory: the file on disk was left behind by any failure.
+        text = "Discord name    | GP\n" + "\n".join(lines) + "\n"
+        await channel.send(file=discord.File(io.BytesIO(text.encode()), filename='promo.txt'))
     except Exception as e:
         print(f"Error: {e}")
         await channel.send(f"Error: {e}")
@@ -1237,64 +1354,87 @@ def refresh_game_roster(IOguild, rows, generation):
     return 'written'
 
 
-async def GP_databases():
-    conn = sqlite3.connect('DatabaseLedBot.db')
-    conn.execute("PRAGMA journal_mode=WAL")
-    c = conn.cursor()
+async def GP_databases(run_key=None, db_path=None):
+    """Take this week's snapshot: totals into {guild}_GP, gains into _GP_gained.
 
-    column_names_dict = await get_date()
-    column_name1 = column_names_dict["column_name1"]
-    column_name2 = column_names_dict["column_name2"]
+    One transaction for both guilds, on a connection that is always closed. It
+    used to autocommit its first ALTER TABLE and roll the rest back on a
+    failure, leaving a half-added column -- and the unclosed connection held
+    the write lock while the error propagated.
 
-    for guild_name in logic.GUILD_NAMES:
+    The gain is measured against the latest measured week, not the column
+    exactly 7 days back, so a missed Saturday no longer breaks every run after
+    it. When weeks were missed, the difference is spread evenly over them and
+    this week (logic.spread_gain): totals stay exact and every report keeps
+    working. Missed weeks go into _GP_gained only, so _GP keeps holding nothing
+    but measured totals.
 
-        table_name_GP = logic.table_name(guild_name, 'GP')
-        table_name_game = logic.table_name(guild_name, 'game')
-        table_name_gained = logic.table_name(guild_name, 'GP_gained')
-    
-        #fills the GP table with total GP
-        c.execute(f"PRAGMA table_info({table_name_GP})")
-        columns = c.fetchall()
-        column_names = [col[1] for col in columns]
-        if column_name1 in column_names:
-            print(f"Column '{column_name1}' already exists in the {table_name_GP} table")
-        else:
-            c.execute(f"ALTER TABLE {table_name_GP} ADD COLUMN {column_name1} TEXT")
-            print(f"Column '{column_name1}' added to {table_name_GP}")
+    run_key is passed in by the weekly job so the export, this and the check
+    all agree on the week even if the run crosses midnight.
+    """
+    if run_key is None:
+        run_key = (get_date())["column_name1"]
+    db = sqlite3.connect(db_path or DB_PATH)
+    try:
+        db.execute("PRAGMA journal_mode=WAL")
+        cursor = db.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+        try:
+            for guild_name in logic.GUILD_NAMES:
+                _take_snapshot(cursor, guild_name, run_key)
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+    finally:
+        db.close()
 
-        c.execute(f'SELECT G_NAME, G_ID FROM {table_name_game} WHERE G_ID NOT IN (SELECT G_ID FROM {table_name_GP})')
-        new_rows = c.fetchall()
-        if new_rows:
-            c.executemany(f'INSERT INTO {table_name_GP} (Name, G_ID) VALUES (?, ?)', new_rows)
-            c.executemany(f'INSERT INTO {table_name_gained} (Name, G_ID) VALUES (?, ?)', new_rows)
-        c.execute(f"UPDATE {table_name_GP} SET {column_name1} = (SELECT GP FROM {table_name_game} WHERE {table_name_game}.G_ID = {table_name_GP}.G_ID)")
 
+def _take_snapshot(cursor, IOguild, run_key):
+    table_gp = logic.table_name(IOguild, 'GP')
+    table_gained = logic.table_name(IOguild, 'GP_gained')
+    table_game = logic.table_name(IOguild, 'game')
 
-        #fill GP gained table
-        c.execute(f"PRAGMA table_info({table_name_gained})")
-        columns = c.fetchall()
-    
-        column_names = [col[1] for col in columns]
-        if column_name1 in column_names:
-            print(f"Column '{column_name1}' already exists in the {table_name_gained} table")
-        else:
-            c.execute(f"ALTER TABLE {table_name_gained} ADD COLUMN {column_name1} TEXT")
-            print(f"Column '{column_name1}' added to {table_name_gained}")
+    previous = _previous_measured(_measured_columns(cursor, IOguild), run_key)
+    missed = logic.missed_snapshot_columns(previous, run_key)
+    filled = [*missed, run_key]
 
-        c.execute(f'SELECT Name, G_ID FROM {table_name_GP}')
-        rows = c.fetchall()
-        for row in rows:
-            result = c.execute(f"SELECT {column_name1} FROM {table_name_GP} WHERE G_ID=?", (row[1],)).fetchone()
-            if result is None or result[0] is None:
-                continue
-            GPnow = int(result[0])
+    if run_key not in _table_columns(cursor, table_gp):
+        cursor.execute(f"ALTER TABLE {table_gp} ADD COLUMN {run_key} TEXT")
+    gained_columns = _table_columns(cursor, table_gained)
+    for column in filled:
+        if column not in gained_columns:
+            cursor.execute(f"ALTER TABLE {table_gained} ADD COLUMN {column} TEXT")
 
-            result = c.execute(f"SELECT {column_name2} FROM {table_name_GP} WHERE G_ID=?", (row[1],)).fetchone()
-            if result is None or result[0] is None:
-                GPold = 0
-            else:
-                GPold = int(result[0])
-            GP_gained = GPnow - GPold
-            c.execute(f"UPDATE {table_name_gained} SET {column_name1} = ? WHERE G_ID = ?", (GP_gained, row[1]))
+    # Per table, and NOT EXISTS rather than NOT IN: one NULL G_ID makes NOT IN
+    # match nothing, and Pretherians has an id in _GP that _GP_gained lacks.
+    for table in (table_gp, table_gained):
+        cursor.execute(
+            f"INSERT INTO {table} (Name, G_ID) SELECT G_NAME, G_ID FROM {table_game} AS r "
+            f"WHERE NOT EXISTS (SELECT 1 FROM {table} AS t WHERE t.G_ID = r.G_ID)"
+        )
+    cursor.execute(
+        f"UPDATE {table_gp} SET {run_key} = "
+        f"(SELECT GP FROM {table_game} WHERE {table_game}.G_ID = {table_gp}.G_ID)"
+    )
 
-    conn.commit()
+    # Cleared first so a re-run leaves nothing from the last attempt behind,
+    # for anyone who has since left.
+    cursor.execute(f"UPDATE {table_gained} SET {', '.join(f'{column} = NULL' for column in filled)}")
+    updates = {column: [] for column in filled}
+    rows = cursor.execute(f"SELECT G_ID, {run_key}, {previous or 'NULL'} FROM {table_gp}").fetchall()
+    for g_id, now_value, previous_value in rows:
+        now_gp = logic.parse_gp_value(now_value)
+        if now_gp is None:
+            continue
+        previous_gp = logic.parse_gp_value(previous_value)
+        if previous_gp is None:
+            # A first appearance stays `GPnow - 0` in this week alone, where
+            # logic.observed_weeks knows to drop it, rather than lifetime GP
+            # spread across weeks before they joined.
+            updates[run_key].append((now_gp, g_id))
+            continue
+        for column, gain in zip(filled, logic.spread_gain(now_gp - previous_gp, len(filled))):
+            updates[column].append((gain, g_id))
+    for column, params in updates.items():
+        cursor.executemany(f"UPDATE {table_gained} SET {column} = ? WHERE G_ID = ?", params)

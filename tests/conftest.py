@@ -34,9 +34,10 @@ def no_bot_run(monkeypatch):
 
 @pytest.fixture
 def temp_functions_db(tmp_path, monkeypatch, request):
-    """Point Functions' module-level connection at a throwaway database so
-    tests never touch the real DatabaseLedBot.db. The roster counters are
-    module state too, so they're reset for each test.
+    """Point Functions' module-level connection, and the path GP_databases
+    opens, at a throwaway database so tests never touch the real
+    DatabaseLedBot.db. The roster counters are module state too, so they're
+    reset for each test.
 
     If a test ever swaps sys.modules['Functions'] without restoring it, this
     would patch the fresh module while the test file still calls the one it
@@ -55,6 +56,9 @@ def temp_functions_db(tmp_path, monkeypatch, request):
     conn = sqlite3.connect(str(db_path))
     monkeypatch.setattr(Functions, "conn", conn)
     monkeypatch.setattr(Functions, "c", conn.cursor())
+    # GP_databases opens its own connection on DB_PATH; without this, one
+    # called with no db_path would write to the real database.
+    monkeypatch.setattr(Functions, "DB_PATH", str(db_path))
     monkeypatch.setattr(Functions, "weekly_job_depth", 0)
     monkeypatch.setattr(Functions, "roster_generation", 0)
     yield db_path

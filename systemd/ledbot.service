@@ -10,6 +10,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# Without this, stdout is block-buffered when it isn't a terminal: print()
+# lines reach the journal late, and are lost if the bot is killed.
+Environment=PYTHONUNBUFFERED=1
 # EDIT these two before installing: the account the bot should run as,
 # and the absolute path where you cloned this repo on the Pi.
 User=pi
