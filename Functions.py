@@ -4,7 +4,6 @@ import inspect
 import discord
 import os
 from dotenv import load_dotenv
-import io
 import json
 from googleapiclient.discovery import build
 from google.oauth2.service_account import Credentials
@@ -1205,42 +1204,45 @@ def link_for_invite(IOguild, g_id, current_name, target):
     return decision, others
 
 
-async def promotions(bot, channel):
+async def promotions_report(discord_guild, today=None):
+    """Pretherians up for promotion, as embeds; [] when nobody qualifies.
+
+    Promotions-role holders whose character is still in the guild and gained
+    at least PROMOTION_GP_REQUIREMENT in the week containing `today` (without
+    it, the latest week taken). Like the other sections, a problem comes back
+    as an embed, never as [] -- that would read as nobody qualifying.
+    """
+    guild_name = logic.PROMOTION_GUILD
+    title = f"{guild_name} -- promotions"
     try:
-        guild = bot.get_guild(809954021028134943)
-        if guild is None:
-            await channel.send("Discord server not in cache, cannot check promotions right now.")
-            return
-        role = discord.utils.get(guild.roles, name="Promotions")
+        if discord_guild is None:
+            return [logic.warning_embed(title, "Not checked: the Discord server isn't in the bot's cache.")]
+        role = discord.utils.get(discord_guild.roles, name=logic.PROMOTION_ROLE)
         if role is None:
-            await channel.send("There is no 'Promotions' role, so nobody can be listed.")
-            return
-        # The latest week that was taken: this week's column doesn't exist
-        # before the 2 AM run or after a missed Saturday.
-        _, column_name1 = await latest_snapshot_day()
-        promo_members = logic.table_name(logic.PROMOTION_GUILD, 'members')
-        promo_gained = logic.table_name(logic.PROMOTION_GUILD, 'GP_gained')
-        c.execute(f'''SELECT PM.D_ID, PM.G_ID, PGG.{column_name1}
-        FROM {promo_members} AS PM
-        JOIN {promo_gained} AS PGG ON PM.G_ID = PGG.G_ID
-        WHERE CAST(PGG.{column_name1} AS INTEGER) >= {logic.PROMOTION_GP_REQUIREMENT}''')
-        lines = []
-        for d_id, _, GP in c.fetchall():
-            member = guild.get_member(d_id)
-            if member is None:
-                print(f"Member with ID {d_id} not found in guild.")
-                continue
-            if role in member.roles:
-                lines.append(f"{member.name.ljust(15)} | {GP}")
-        if not lines:
-            await channel.send('No members meet the requirements')
-            return
-        # Built in memory: the file on disk was left behind by any failure.
-        text = "Discord name    | GP\n" + "\n".join(lines) + "\n"
-        await channel.send(file=discord.File(io.BytesIO(text.encode()), filename='promo.txt'))
+            return [logic.warning_embed(title, f"Not checked: there is no '{logic.PROMOTION_ROLE}' role.")]
+        # role.members is read from the member cache, so a partial one would
+        # quietly leave people off the list.
+        if not discord_guild.chunked:
+            return [logic.warning_embed(title, "Not checked: the server's member list isn't fully loaded yet.")]
+        if today is None:
+            today, _ = await latest_snapshot_day()
+        column = get_date(today)["column_name1"]
+        members_table = logic.table_name(guild_name, 'members')
+        game_table = logic.table_name(guild_name, 'game')
+        gained_table = logic.table_name(guild_name, 'GP_gained')
+        linked_gains = c.execute(
+            f"SELECT m.D_ID, g.G_NAME, p.{column} FROM {members_table} AS m "
+            f"JOIN {game_table} AS g ON g.G_ID = m.G_ID "
+            f"JOIN {gained_table} AS p ON p.G_ID = m.G_ID"
+        ).fetchall()
+        holders = {
+            str(member.id): logic.account_label(member.display_name, member.name)
+            for member in role.members
+        }
+        return logic.format_promotions(logic.select_promotions(linked_gains, holders))
     except Exception as e:
-        print(f"Error: {e}")
-        await channel.send(f"Error: {e}")
+        print("line: " + str(inspect.currentframe().f_lineno) + "\n error: " + str(e))
+        return [logic.failure_embed(f"{title} failed", e)]
 
 
     

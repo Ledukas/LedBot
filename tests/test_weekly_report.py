@@ -85,15 +85,30 @@ class TestFormatRedGp:
         [embed] = logic.format_red_gp("Aetherians", df)
         assert embed.title == "Aetherians -- red GP (2)"
         lines = embed.description.split("\n")
-        assert lines[1] == "Name            9/12 9/19 9/26 10/3  avg"
-        assert lines[2] == "Semaphore        610  550  610    0  443"
-        assert lines[3] == "cioo4              -  340    0   10  117"
+        assert lines[1] == "Name      |9/12|9/19|9/26|10/3| avg"
+        assert lines[2] == "----------+----+----+----+----+----"
+        assert lines[3] == "Semaphore | 610| 550| 610|   0| 443"
+        assert lines[4] == "cioo4     |   -| 340|   0|  10| 117"
         assert balanced(embed.description)
 
-    def test_lines_stay_phone_width(self):
-        df = red_frame([("n" * 15, f"G{i}", 2410, 1660, 1200, 0) for i in range(5)])
+    def test_a_five_character_date_keeps_the_header_in_line(self):
+        weeks = ["GP2026_09_19", "GP2026_09_26", "GP2026_10_03", "GP2026_10_10"]
+        df = logic.filter_red_gp(gp_frame([("Salhou", "A", 0, 0, 0, 0)], weeks), "Aetherians", [])
         [embed] = logic.format_red_gp("Aetherians", df)
-        assert max(len(line) for line in embed.description.split("\n")) <= 40
+        header, rule, row = embed.description.split("\n")[1:4]
+        assert header == "Name   |9/19|9/26|10/3|10/10| avg"
+        assert [i for i, ch in enumerate(header) if ch == "|"] == [i for i, ch in enumerate(row) if ch == "|"]
+        assert [i for i, ch in enumerate(rule) if ch == "+"] == [i for i, ch in enumerate(row) if ch == "|"]
+
+    def test_lines_stay_phone_width(self):
+        """15 characters is the game's longest name; 42 is about what a phone
+        shows of an embed's code block before wrapping."""
+        weeks = ["GP2026_09_19", "GP2026_09_26", "GP2026_10_03", "GP2026_10_10"]
+        df = logic.filter_red_gp(
+            gp_frame([("n" * 15, f"G{i}", 2410, 1660, 1200, 0) for i in range(5)], weeks), "Aetherians", []
+        )
+        [embed] = logic.format_red_gp("Aetherians", df)
+        assert max(len(line) for line in embed.description.split("\n")) <= 42
 
     def test_a_whole_guild_splits_into_valid_embeds(self):
         """An event week can put most of a guild on the list."""
@@ -102,14 +117,14 @@ class TestFormatRedGp:
         assert len(embeds) > 1
         assert embeds[0].title == "Aetherians -- red GP (210)"
         assert all(embed.title.endswith("(cont.)") for embed in embeds[1:])
-        header = embeds[0].description.split("\n")[1]
+        header = embeds[0].description.split("\n")[1:3]
         listed = []
         for text in descriptions(embeds):
             assert len(text) <= logic.EMBED_DESCRIPTION_LIMIT
             assert balanced(text)
             lines = text.split("\n")
-            assert lines[1] == header
-            listed += [line.split()[0] for line in lines[2:-1]]
+            assert lines[1:3] == header
+            listed += [line.split()[0] for line in lines[3:-1]]
         assert sorted(listed) == sorted(f"member_{i:03d}_xx" for i in range(210))
 
 
@@ -330,7 +345,7 @@ def weekly(temp_functions_db, no_bot_run, monkeypatch, tmp_path):
 
     state = SimpleNamespace(
         mod=mod, calls=calls, sections={}, dataframe_days=[], discord_warnings=[], module=LedBotCode,
-        taken={WEEK}, snapshot={}, export_error=None, export_retry=[],
+        taken={WEEK}, snapshot={}, export_error=None, export_retry=[], promotion_days=[],
     )
     monkeypatch.setattr(LedBotCode, "LedukasSpam_channel", mod)
     monkeypatch.setattr(LedBotCode, "LedukasSpam_channelID", MOD_CHANNEL_ID)
@@ -350,6 +365,12 @@ def weekly(temp_functions_db, no_bot_run, monkeypatch, tmp_path):
     monkeypatch.setattr(Functions, "red_gp_report", build("red"))
     monkeypatch.setattr(Functions, "gp_audit_report", build("audit"))
     monkeypatch.setattr(Functions, "links_report", build("links"))
+
+    async def promotions_report(discord_guild, today=None):
+        calls.append("promotions")
+        state.promotion_days.append(today)
+        return state.sections.get("promotions", [])
+    monkeypatch.setattr(Functions, "promotions_report", promotions_report)
     return state
 
 
@@ -386,6 +407,19 @@ class TestWeeklyRun:
         assert titles == ["Aetherians -- red GP (40)", "Pretherians -- links"]
         assert kwargs['embeds'][-1].footer.text == f"{SNAPSHOT_NOTE} · Backup: Database_2026_10_03.db"
         assert kwargs['allowed_mentions'].everyone is False
+
+    def test_promotions_follow_the_promotion_guilds_red_list(self, weekly):
+        weekly.sections["red:Pretherians"] = section("Pretherians -- red GP (14)")
+        weekly.sections["promotions"] = section("Pretherians -- promotions, 400+ GP (2)")
+        weekly.sections["audit:Pretherians"] = section("Pretherians -- GP audit")
+        run(weekly)
+        titles = [embed.title for embed in weekly.mod.sent[0][1]['embeds']]
+        assert titles == [
+            "Pretherians -- red GP (14)", "Pretherians -- promotions, 400+ GP (2)", "Pretherians -- GP audit",
+        ]
+        # Once, for the promotion guild only, and for the run's own week.
+        assert weekly.calls.count("promotions") == 1
+        assert weekly.promotion_days == weekly.dataframe_days[-1:]
 
     def test_snapshot_problems_open_the_report(self, weekly):
         weekly.snapshot["Pretherians"] = {'recorded': 10, 'zeros': 9, 'roster': 10}

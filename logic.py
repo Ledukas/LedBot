@@ -45,6 +45,7 @@ PROMOTION_GUILD = "Pretherians"
 # one from the other, or changing the activity report would silently move the
 # promotion bar too.
 PROMOTION_GP_REQUIREMENT = 400
+PROMOTION_ROLE = "Promotions"
 
 # Each guild owns one table per kind, named "{guild}_{kind}".
 TABLE_KINDS = ('members', 'discord', 'game', 'GP', 'GP_gained')
@@ -563,7 +564,6 @@ ERROR_COLOR = 0xE74C3C
 
 TRUNCATED_NOTE = "...truncated"
 
-RED_GP_NAME_WIDTH = 15
 RED_GP_VALUE_WIDTH = 4
 
 
@@ -648,6 +648,46 @@ def _gp_cell(value) -> str:
     return str(math.floor(float(value) + 0.5))
 
 
+def pipe_table(
+    header: list[str],
+    rows: list[list[str]],
+    align: str,
+    min_widths: list[int] | None = None,
+) -> tuple[str, list[str]]:
+    """(header lines, row lines) of a compact `|` table, for table_embeds.
+
+    align has one 'l' or 'r' per column. Numbers sit flush against the
+    dividers and only text columns are padded, which keeps the red list near
+    40 characters -- about what a phone shows in an embed's code block before
+    it wraps. Widths come from the data, so a date like 10/10 can't push its
+    header out of line, and every chunk of a long table shares them.
+
+    Put a column of unbounded text (a Discord name) last: it isn't padded, so
+    one long name only lengthens its own line.
+    """
+    # Discord display names can contain '|', which would add a column.
+    table = [[str(cell).replace("|", "¦") for cell in row] for row in [header, *rows]]
+    min_widths = min_widths or [0] * len(header)
+    widths = [max(min_widths[i], *(len(row[i]) for row in table)) for i in range(len(header))]
+    last = len(header) - 1
+
+    def cell(text: str, i: int) -> str:
+        if align[i] == "r":
+            return text.rjust(widths[i])
+        if i == last:
+            return " " + text
+        return ("" if i == 0 else " ") + text.ljust(widths[i]) + " "
+
+    lines = ["|".join(cell(text, i) for i, text in enumerate(row)) for row in table]
+    # An unpadded last column's rule stops at its heading, so one long name
+    # can't make the rule wrap on a phone too.
+    rule = "+".join(
+        "-" * len(cell(header[i] if align[i] == "l" and i == last else "x" * widths[i], i))
+        for i in range(len(header))
+    )
+    return lines[0] + "\n" + rule, lines[1:]
+
+
 def format_red_gp(io_guild: str, df: pd.DataFrame) -> list[discord.Embed]:
     """filter_red_gp's output as a table: one line per member, about 40
     characters, so it reads inside an embed on a phone. [] when nobody is red.
@@ -659,19 +699,57 @@ def format_red_gp(io_guild: str, df: pd.DataFrame) -> list[discord.Embed]:
     if df.empty:
         return []
     week_columns = list(df.columns[1:5])
-    header = (
-        "Name".ljust(RED_GP_NAME_WIDTH) + " "
-        + " ".join(gp_date_label(column).rjust(RED_GP_VALUE_WIDTH) for column in week_columns)
-        + " " + "avg".rjust(RED_GP_VALUE_WIDTH)
+    header, rows = pipe_table(
+        ["Name", *(gp_date_label(column) for column in week_columns), "avg"],
+        [
+            [str(row['Name']), *(_gp_cell(row[column]) for column in week_columns), _gp_cell(row['Average'])]
+            for _, row in df.iterrows()
+        ],
+        "l" + "r" * (len(week_columns) + 1),
+        [0] + [RED_GP_VALUE_WIDTH] * (len(week_columns) + 1),
     )
-    rows = [
-        str(row['Name']).ljust(RED_GP_NAME_WIDTH) + " "
-        + " ".join(_gp_cell(row[column]).rjust(RED_GP_VALUE_WIDTH) for column in week_columns)
-        + " " + _gp_cell(row['Average']).rjust(RED_GP_VALUE_WIDTH)
-        for _, row in df.iterrows()
-    ]
     return table_embeds(
         f"{io_guild} -- red GP ({len(rows)})", header, rows, guild_color(io_guild)
+    )
+
+
+def select_promotions(
+    linked_gains: list[tuple],
+    role_holders: dict[str, str],
+    requirement: int = PROMOTION_GP_REQUIREMENT,
+) -> list[tuple[str, int, str]]:
+    """(character, GP, Discord label) for everyone up for promotion, most GP first.
+
+    linked_gains is (D_ID, character, stored gain) per link row of a character
+    still in the guild; role_holders maps the accounts holding the Promotions
+    role to their labels. A character assigned twice to one account is listed
+    once.
+    """
+    picked = {}
+    for d_id, character, stored in linked_gains:
+        d_id = normalize_discord_id(d_id)
+        gain = parse_gp_value(stored)
+        if d_id in role_holders and gain is not None and gain >= requirement:
+            picked[(d_id, character)] = (character, gain, role_holders[d_id])
+    return sorted(picked.values(), key=lambda entry: (-entry[1], entry[0].casefold()))
+
+
+def format_promotions(
+    promotions: list[tuple[str, int, str]],
+    io_guild: str = PROMOTION_GUILD,
+    requirement: int = PROMOTION_GP_REQUIREMENT,
+) -> list[discord.Embed]:
+    """select_promotions' output as a table; [] when nobody qualifies."""
+    if not promotions:
+        return []
+    header, rows = pipe_table(
+        ["Character", "GP", "Discord"],
+        [[character, str(gain), label] for character, gain, label in promotions],
+        "lrl",
+        [0, RED_GP_VALUE_WIDTH, 0],
+    )
+    return table_embeds(
+        f"{io_guild} -- promotions, {requirement}+ GP ({len(rows)})", header, rows, guild_color(io_guild)
     )
 
 

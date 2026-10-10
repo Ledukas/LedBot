@@ -834,9 +834,13 @@ async def mygains2(IOguild, c, user_did):
 @bot.command(name='promotions')
 @commands.has_role("Moderator")
 async def promotions(ctx):
-    # Falls back to where it was asked: with the mod channel not cached there
-    # was nowhere to post, not even the error.
-    await Functions.promotions(bot, LedukasSpam_channel or ctx.channel)
+    """The weekly report's promotions section, on demand, where it was asked."""
+    embeds = await Functions.promotions_report(bot.get_guild(809954021028134943))
+    await send_embeds(
+        ctx, embeds,
+        None if embeds else f"Nobody qualifies for promotion this week "
+                            f"({logic.PROMOTION_GP_REQUIREMENT}+ GP and the {logic.PROMOTION_ROLE} role).",
+    )
 
 @bot.command(name='whois')
 @commands.has_role("Moderator")
@@ -1038,7 +1042,6 @@ async def _run_weekly_gp(ack_channel, run_key=None, retry=False):
             guild_failure = await collect_guild_report(guild_name, report, sync_roles=True, today=week_day)
             if failure is None:
                 failure = guild_failure
-        #await Functions.promotions(bot, LedukasSpam_channel)
     finally:
         # In a finally because GP_databases above has already written this
         # week's columns. A cycle that failed partway is exactly when a
@@ -1109,6 +1112,8 @@ async def collect_guild_report(guild_name, report, sync_roles, today=None):
                         f"{guild_name} -- rank roles", f"Not fully synced: {roles_status}"
                     ))
         report.extend(Functions.red_gp_report(monthly_gp_df, guild_name))
+    if guild_name == logic.PROMOTION_GUILD:
+        report.extend(await Functions.promotions_report(bot.get_guild(809954021028134943), today))
     report.extend(Functions.gp_audit_report(guild_name))
     report.extend(links_for(guild_name))
     return failure
