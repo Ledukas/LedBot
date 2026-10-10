@@ -470,6 +470,15 @@ class TestWelcome:
         assert "{" not in text and "}" not in text
         assert len(text) < 2000
 
+    def test_server_emojis_are_filled_and_unknown_ones_left(self):
+        text = logic.format_welcome(GUILD, 1, 2, 3, {"ye": "<:ye:11>", "Aetherians": "<:Aetherians:12>"})
+        assert "Welcome to the guild! <:ye:11>\n" in text
+        assert text.endswith("Let's grow strong together! <:Aetherians:12>")
+        assert ":maestro:" in text
+
+    def test_colons_in_ordinary_text_are_not_emojis(self):
+        assert logic.fill_emojis("here: <#3> :ye: 10:30", {"ye": "Y", "30": "no"}) == "here: <#3> Y 10:30"
+
     def test_a_literal_brace_in_the_text_cannot_break_it(self, monkeypatch):
         """Filled with str.replace, not str.format, so an edit adding a brace
         can't turn every welcome into a KeyError."""
@@ -534,3 +543,14 @@ class TestInviteMessages:
         linked = invite(1, "Bob", status=logic.INVITE_LINKED)
         linked.update(matched_name="Bob", matched_g_id="X")
         assert "!relink" in logic.format_uninvite(GUILD, linked)
+
+
+class TestGainedGuildRole:
+    def test_a_guild_role_added(self):
+        assert logic.gained_guild_role(["Waiting to Join"], ["Waiting to Join", "Pretherians"])
+
+    def test_already_had_it(self):
+        assert not logic.gained_guild_role(["Aetherians"], ["Aetherians", "Other"])
+
+    def test_some_other_role(self):
+        assert not logic.gained_guild_role([], ["Former Aetherian"])

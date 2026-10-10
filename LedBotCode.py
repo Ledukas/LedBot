@@ -51,6 +51,8 @@ roles_to_remove = {
 # !kick hands this out, so a returning member arrives carrying it; the invite
 # auto-link takes it back off.
 FORMER_ROLE_NAME = roles_to_remove['giverole']
+# "Waiting to Join": taken off whenever a guild role is given, by the bot or by hand.
+WAITING_ROLE_ID = 809963612114386954
 
 # Only the email mapping is local -- the guild ids live in logic.GUILD_GIDS.
 guild_emails = {"Aetherians": email_a, "Pretherians": email_p}
@@ -1561,14 +1563,30 @@ async def post_welcome(IOguild, member):
     channel = bot.get_channel(WELCOME_POST_CHANNEL_ID)
     if channel is None:
         return f"No welcome posted: channel {WELCOME_POST_CHANNEL_ID} wasn't found."
+    emojis = {emoji.name: str(emoji) for emoji in getattr(getattr(channel, 'guild', None), 'emojis', ())}
     try:
         await channel.send(
-            logic.format_welcome(IOguild, member.id, WELCOME_INFO_CHANNEL_ID, ROLES_CHANNEL_ID),
+            logic.format_welcome(IOguild, member.id, WELCOME_INFO_CHANNEL_ID, ROLES_CHANNEL_ID, emojis),
             allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=[member]),
         )
     except discord.HTTPException as e:
         return f"The welcome couldn't be posted ({e})."
     return None
+
+@bot.listen('on_member_update')
+async def remove_waiting_role(before, after):
+    if after.guild.id != 809954021028134943:
+        return
+    if not logic.gained_guild_role([r.name for r in before.roles], [r.name for r in after.roles]):
+        return
+    waiting = after.guild.get_role(WAITING_ROLE_ID)
+    if waiting is None or waiting not in after.roles:
+        return
+    try:
+        await after.remove_roles(waiting, reason="Given a guild role")
+        print(f"Removed '{waiting.name}' from {after} (given a guild role)")
+    except discord.HTTPException as e:
+        print(f"Couldn't remove '{waiting.name}' from {after}: {e}", file=sys.stderr)
 
 ##---------------------------------------------  Errors
 # error messages for all commands

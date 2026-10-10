@@ -2294,16 +2294,18 @@ def validate_discord_rows(rows: list[dict], current_count: int) -> str | None:
     return None
 
 
+# :name: is the server's custom emoji of that name (fill_emojis); one the
+# server doesn't have stays as plain text.
 WELCOME_TEXT = (
-    "{member} Welcome to the guild!\n"
+    "{member} Welcome to the guild! :ye:\n"
     "Our guild's home world is Skull 1, so please switch to it and set it as a favorite!\n"
     "GP is counted each Saturday, which means your in-game counter does not represent "
     "your actual GP earned. Please read {welcome_channel} for more information.\n"
     "If you are a Pretherian and you want to be eligible to be promoted to Aetherians "
-    "later on, pick up the role here: {roles_channel}\n"
+    "later on, pick up the role here: {roles_channel} :maestro:\n"
     "\n"
     "If you want to ask any questions or join discussions, don't hesitate to do so. "
-    "Let's grow strong together!"
+    "Let's grow strong together! :Aetherians:"
 )
 
 # One entry per guild so they can diverge later without a code change; the
@@ -2311,18 +2313,34 @@ WELCOME_TEXT = (
 WELCOME_MESSAGES = {guild: WELCOME_TEXT for guild in GUILD_NAMES}
 
 
-def format_welcome(io_guild: str, d_id, welcome_channel_id: int, roles_channel_id: int) -> str:
+EMOJI_NAME_RE = re.compile(r':([A-Za-z0-9_]{2,32}):')
+
+
+def fill_emojis(text: str, emojis: dict[str, str]) -> str:
+    """text with each :name: replaced by emojis[name] (a custom emoji's
+    <:name:id> form); names not in emojis are left as they are."""
+    return EMOJI_NAME_RE.sub(lambda match: emojis.get(match.group(1), match.group(0)), text)
+
+
+def format_welcome(
+    io_guild: str, d_id, welcome_channel_id: int, roles_channel_id: int, emojis: dict[str, str] | None = None,
+) -> str:
     """The welcome for a new member of io_guild.
 
     Filled with str.replace rather than str.format, so a literal brace anyone
     adds to the text later can't turn every welcome into a KeyError.
     """
     return (
-        WELCOME_MESSAGES[io_guild]
+        fill_emojis(WELCOME_MESSAGES[io_guild], emojis or {})
         .replace('{member}', f'<@{d_id}>')
         .replace('{welcome_channel}', f'<#{welcome_channel_id}>')
         .replace('{roles_channel}', f'<#{roles_channel_id}>')
     )
+
+
+def gained_guild_role(before_roles: list[str], after_roles: list[str]) -> bool:
+    """Whether a member update gave them a guild role they didn't have."""
+    return any(name in GUILD_NAMES for name in set(after_roles) - set(before_roles))
 
 
 def suggest_assign_command(io_guild: str, d_id, name: str) -> str:

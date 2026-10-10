@@ -488,3 +488,25 @@ class TestRequestErrors:
         with pytest.raises(mod.FirebaseRequestError) as failure:
             asyncio.run(mod.get_json("https://example", params={'auth': "t"}))
         assert failure.value.maybe_sent is maybe_sent
+
+
+class TestWaitingRole:
+    WAITING = SimpleNamespace(name="Waiting to Join", id=809963612114386954)
+
+    def update(self, bot_module, before_names, after_names, guild_id=809954021028134943):
+        guild = SimpleNamespace(id=guild_id, get_role=lambda rid: self.WAITING if rid == self.WAITING.id else None)
+        before = SimpleNamespace(roles=[SimpleNamespace(name=n) for n in before_names])
+        after = FakeMember(111, [SimpleNamespace(name=n) for n in after_names])
+        after.guild = guild
+        after.roles.append(self.WAITING)
+        asyncio.run(bot_module.module.remove_waiting_role(before, after))
+        return after.roles
+
+    def test_removed_when_a_guild_role_is_given(self, bot_module):
+        assert self.WAITING not in self.update(bot_module, ["Waiting to Join"], ["Waiting to Join", GUILD])
+
+    def test_kept_for_any_other_role_change(self, bot_module):
+        assert self.WAITING in self.update(bot_module, ["Waiting to Join"], ["Waiting to Join", "Other"])
+
+    def test_only_in_our_server(self, bot_module):
+        assert self.WAITING in self.update(bot_module, [], [GUILD], guild_id=1)
