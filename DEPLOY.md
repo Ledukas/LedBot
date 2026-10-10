@@ -2,8 +2,20 @@
 
 ## One-time setup
 
+The Pi pulls the code with a read-only **deploy key**: it can read this one repository and nothing else, and can't push. Create it as the account the bot runs as, then add the public key under the repository's Settings → Deploy keys (or `gh repo deploy-key add <file> --repo Ledukas/LedBot` from a machine logged in to GitHub), leaving "Allow write access" off:
+
 ```bash
-git clone <this repo> ~/LedBot
+ssh-keygen -t ed25519 -N "" -C "LedBot Pi deploy key" -f ~/.ssh/github_ledbot
+printf 'Host github.com\n    IdentityFile ~/.ssh/github_ledbot\n    IdentitiesOnly yes\n' >> ~/.ssh/config
+ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts
+ssh-keygen -lf ~/.ssh/known_hosts   # github.com must be SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU
+cat ~/.ssh/github_ledbot.pub        # this is what goes into Deploy keys
+```
+
+The key has no passphrase so pulls need no one at the keyboard; if the Pi is lost, deleting the deploy key on GitHub is all it takes to cut it off. Then:
+
+```bash
+git clone git@github.com:Ledukas/LedBot.git ~/LedBot
 cd ~/LedBot
 python3 -m venv venv
 venv/bin/pip install -r requirements.txt
@@ -45,9 +57,15 @@ After pulling a change to `systemd/ledbot.service`, re-run the `cp` and `daemon-
 sudo systemctl status ledbot.service
 journalctl -u ledbot.service -f
 
-# After pulling code changes
-sudo systemctl restart ledbot.service
+# Update to the latest main
+cd ~/LedBot && git pull --ff-only && sudo systemctl restart ledbot.service
 ```
+
+A restart is safe at any time. A week that's already taken isn't run again, and retries keep their schedule (it's kept in the database, not in memory). The one moment to avoid is the Saturday run itself, normally about a minute from 2 AM: interrupting it loses nothing -- it writes in one transaction -- but the report waits for the next start and a retry.
+
+If `requirements.txt` changed, run `venv/bin/pip install -r requirements.txt` before the restart.
+
+Only one copy of the bot may ever run: they share the Discord token, so a second copy (an old Pi, a test run on a PC) would answer every command twice and write its own snapshots.
 
 ## Backups
 

@@ -143,6 +143,8 @@ Discord accounts show as `display (username)` where they differ (`logic.account_
 
 `!invite <guild> <name> [@member]` sends the in-game invite and then watches for the invitee; when they arrive it writes the link row, gives the guild role, removes `Former Aetherian` (which `!kick` hands out), and posts the welcome in #aether-chair. Everything is reported to the mod channel. Without `@member` the invite is watched but a match is reported with a ready `!assign`, never linked.
 
+The welcome's `:name:` emojis (`logic.WELCOME_TEXT`) are filled from the server's custom emojis by name at send time (`logic.fill_emojis`), so no emoji ids are hardcoded; a name the server doesn't have stays as plain text rather than breaking the post. `Waiting to Join` (`WAITING_ROLE_ID`) is not removed here but by the `remove_waiting_role` listener on `on_member_update`, which takes it off anyone who *gains* a guild role -- from the auto-link or a moderator by hand alike. Only a gain triggers it, so a member who already had both roles before it existed keeps `Waiting to Join` until it's removed by hand.
+
 **The game never says who accepted an invite.** This was checked exhaustively: the `igs` response is only `{"result":"true"}`, other players' account data (`_uid/{id}`) is 401, the guild node has no invite or join records, and a real invite from a clean test guild wrote nothing anywhere. The only signal is a new account id appearing in `_guild/{gid}/m`. Everything in `logic.match_invites` is about attributing an arrival from that alone, and refusing when it can't be sure:
 
 1. **Name** -- the arrival displays the invited name (casefolded). Character names are unique game-wide, so this is certain -- *but* the guild may display a different character of the invitee's account, which is why the other rules exist.
@@ -170,5 +172,7 @@ Rules that look arbitrary but aren't, each pinned in `tests/test_logic_invites.p
 The main Discord guild ID (`809954021028134943`) and several role/channel IDs are hardcoded inline throughout `LedBotCode.py` and `Functions.py` rather than pulled from `.env` (unlike `SPAM_CHANNEL_ID`, which is). Be aware of this when reading code that looks like it should be configurable but isn't.
 
 ### Permissions
+
+Messages that mention someone are sent with `allowed_mentions` set explicitly, because the bot's default lets every mention ping. Only four ping on purpose: the welcome (the new member only), `!gemdrop` (its role), the hourly Spiketrap reminder (its role) and the giveaway winner. Mod-channel reports, `send_embeds` and the invite replies use `AllowedMentions.none()`, so `<@id>` in them only displays. Keep new messages that name members to that: an accidental ping is hard to take back.
 
 Nearly all commands are gated with `@commands.has_role("Moderator")` or `@commands.has_any_role(...)`. There's no slash-command permission model in use despite `discord.app_commands` being imported — commands are plain prefix commands (`!`).
