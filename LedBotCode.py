@@ -44,8 +44,9 @@ conn.execute("PRAGMA journal_mode=WAL")
 roles_to_remove = {
     # Both guild roles plus every rank role, top one included. 'True Aetherian'
     # used to be omitted here, so a kicked top-rank member kept it while every
-    # other rank lost theirs; that was an oversight, not intent.
-    'removeroles': list(logic.GUILD_NAMES) + logic.RANK_ROLE_NAMES,
+    # other rank lost theirs; that was an oversight, not intent. 'Red GP' is
+    # handed out by mods, not the bot, so nothing else would ever take it off.
+    'removeroles': list(logic.GUILD_NAMES) + logic.RANK_ROLE_NAMES + ['Red GP'],
     'giverole': 'Former Aetherian',
 }
 # !kick hands this out, so a returning member arrives carrying it; the invite
